@@ -34,7 +34,7 @@ def main():
     if (args.sparsity or args.prunen) and not args.gmp:
         opt_sparsellm(model, dataloader, torch.device('cuda'), args)
 
-    for dataset in ['wikitext2', 'ptb', 'c4']:
+    for dataset in ['wikitext2',  'c4']:  # 'ptb',
         dataloader, testloader = get_loaders(dataset, seed=args.seed, model=args.model, seqlen=model.seqlen)
         opt_eval(model, testloader, torch.device('cuda'), args, dataset)
 
