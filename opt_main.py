@@ -24,7 +24,35 @@ def main():
     parser.add_argument('--invert', action='store_true', help='Invert subset.')
     parser.add_argument('--save', type=str, default='', help='Path to saved model.')
     parser.add_argument('--log_wandb', action='store_true', help='Whether to log to wandb.')
-
+    parser.add_argument(
+        '--use_vacuum', 
+        action='store_true', 
+        help='Whether to use the vacuum pruning method for FFN layers.'
+    )
+    parser.add_argument(
+        '--n_vac', 
+        type=int, 
+        default=3, 
+        help='Power of the vacuum function w^(2n+1).'
+    )
+    parser.add_argument(
+        '--lmbda_vac', 
+        type=float, 
+        default=0.01, 
+        help='Lambda regularization for the vacuum cooking phase.'
+    )
+    parser.add_argument(
+        '--cooking_iters', 
+        type=int, 
+        default=20, 
+        help='Number of optimization steps in the vacuum cooking phase.'
+    )
+    parser.add_argument(
+        '--lr_vac', 
+        type=float, 
+        default=1e-3, 
+        help='Learning rate for the vacuum optimizer.'
+    )
     args = parser.parse_args()
 
     model = get_opt(args)
