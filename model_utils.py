@@ -235,17 +235,16 @@ def opt_sparsellm(model, dataloader, dev, args):
                 if args.use_vacuum and name in ['fc1', 'fc2']:
                     print('Pruning with VACUUM ...')
                     gpts[name].fasterprune_vacuum(
-                        args.sparsity,
-                        prunen=args.prunen,
-                        prunem=args.prunem,
-                        blocksize=args.blocksize,
-                        percdamp=args.percdamp,
-                        # Pass new vacuum-specific hyperparameters from args
-                        n_vac=args.n_vac,
-                        lmbda=args.lmbda_vac,
-                        cooking_iters=args.cooking_iters,
-                        lr_vac=args.lr_vac
-                    )
+                    args.sparsity,
+                    prunen=args.prunen,
+                    prunem=args.prunem,
+                    blocksize=args.blocksize,
+                    percdamp=args.percdamp,
+                    n_vac=args.n_vac,
+                    lmbda=args.lmbda_vac,   # Passes as 'lmbda'
+                    cooking_iters=args.cooking_iters,
+                    lr_vac=args.lr_vac      # Passes as 'lr_vac'
+                                        )
                 else:
                     print('Pruning with SparseGPT ...')
                     gpts[name].fasterprune(
