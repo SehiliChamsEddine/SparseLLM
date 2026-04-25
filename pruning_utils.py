@@ -165,38 +165,32 @@ class SparseGPT_OPT:
             # print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
     def fasterprune_vacuum(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
-        n_vac=1, lmbda=0.0001, cooking_iters=0, lr_vac=0
+        n_vac=1
     ):
-        """
-        ULTIMATE VACUUM PRUNING
-        Implements the 'Survival of the Fittest' logic from your images 
-        using a mathematically stable one-pass approach.
-        """
-        # 1. SETUP
+        # 1. SETUP - Work in Float32 for precision
         W = self.layer.weight.data.clone().float()
         W_orig = W.clone()
         H = self.H.float()
-        
-        tick = time.time()
-        
-        # 2. THE VACUUM IMPORTANCE (Image 1 & 2)
-        # Instead of a dangerous optimization loop, we calculate the 'Warped Signal'
-        # This determines which weights are 'important enough' to escape the vacuum.
-        # We use w^(2n+1) to create the dead-zone around zero.
-        with torch.no_grad():
-            W_warped = torch.pow(W, 2 * n_vac + 1)
-            # survival_score = Warped Magnitude / Hessian Uncertainty
-            # This is the 'Modified Gradient' idea expressed as a ranking score.
-            survival_score = W_warped.abs() 
-
-        # 3. THE SAFE EXECUTION (Industry Standard SparseGPT Math)
-        # We use the mask from the vacuum, but the original logic to carry the error.
-        W = W_orig.clone()
         dead = torch.diag(H) == 0
         H[dead, dead] = 1
         W[:, dead] = 0
+
+        tick = time.time()
+
+        # 2. THE VACUUM IMPORTANCE (Image 1 Logic)
+        # We normalize weights so the largest is 1.0. 
+        # This ensures the 'plateau' in your vacuum graph actually aligns with the weights.
+        max_val = torch.max(torch.abs(W)) + 1e-9
+        W_norm = W / max_val
         
-        # Prepare Inverse Hessian
+        # Apply the Vacuum function phi(w) = w^(2n+1)
+        # This creates the 'Attraction to zero' for small normalized weights
+        W_vac = torch.pow(W_norm, 2 * n_vac + 1)
+        
+        # Denormalize back to the original scale
+        W_importance = W_vac * max_val
+
+        # 3. PREPARE HESSIAN
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
@@ -205,6 +199,7 @@ class SparseGPT_OPT:
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
 
+        # 4. SparseGPT BLOCK LOOP
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
@@ -213,20 +208,21 @@ class SparseGPT_OPT:
             Err1 = torch.zeros_like(W1)
             Hinv1 = Hinv[i1:i2, i1:i2]
             
-            # Use our VACUUM SURVIVAL scores to decide the mask
-            # This is where we beat Magnitude Pruning.
-            imp_block = survival_score[:, i1:i2]
-            tmp_metric = imp_block**2 / (torch.diag(Hinv1).reshape((1, -1))**2 + 1e-9)
+            # Use Vacuum-Warped importance to pick the mask
+            # This is the "Smarter Selection"
+            imp_block = W_importance[:, i1:i2]
+            # Pruning Metric: (Vacuumized Weight)^2 / Hessian Uncertainty
+            tmp_metric = imp_block**2 / (torch.diag(Hinv1).reshape((1, -1)) + 1e-9)
             thresh = torch.sort(tmp_metric.flatten())[0][int(tmp_metric.numel() * sparsity)]
             mask1 = tmp_metric <= thresh
 
             for i in range(count):
                 w = W1[:, i]; d = Hinv1[i, i]
                 q = w.clone()
-                q[mask1[:, i]] = 0 # Prune weights identified by the vacuum
+                q[mask1[:, i]] = 0 # Kill weights
                 Q1[:, i] = q
 
-                # Correction step (The Tailoring)
+                # Correction (The Tailoring)
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 Err1[:, i] = err1
@@ -234,12 +230,11 @@ class SparseGPT_OPT:
             W[:, i1:i2] = Q1
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
-        # 4. FINAL CLEANUP
-        torch.cuda.synchronize()
+        # 5. FINAL CONVERSION
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        print(f"Vacuum-Masked Pruning Complete. Stability Preserved.")
+        print(f"Vacuum Pruning (n={n_vac}) Done.")
         
     def free(self):
         if DEBUG:
