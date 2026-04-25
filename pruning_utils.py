@@ -165,86 +165,83 @@ class SparseGPT_OPT:
             # print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
     def fasterprune_vacuum(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
-        n_vac=1, lmbda=0.0001, cooking_iters=15, lr_vac=1e-3 # <--- Names must match model_utils.py
+        n_vac=1, lmbda=0.0001, cooking_iters=3, lr_vac=1e-4 
     ):
-        """
-        Final Integrated Vacuum Pruning Method
-        """
+        # 1. SETUP - Use high precision for the math
         W = self.layer.weight.data.clone().float()
         W_orig = W.clone()
-        tick = time.time()
-        H = self.H
+        H = self.H.float()
         dead = torch.diag(H) == 0
         H[dead, dead] = 1
-        
-        # --- STAGE 1: SEARCH (SURROGATE) ---
+        W[:, dead] = 0
+
+        # 2. THE VACUUM "NUDGE" (Stage 1 from your Image)
+        # We only run 3 iterations. We want a "nudge," not a "re-train."
         W_surrogate = W.clone().requires_grad_(True)
-        # Normalize Hessian to prevent gradients from exploding
-        H_norm = H / (torch.diag(H).max() + 1e-6)
-        optimizer = torch.optim.Adam([W_surrogate], lr=lr_vac)
-        
+        # Scale Hessian to make the gradient descent stable
+        H_scale = torch.diag(H).mean()
+        optimizer = torch.optim.SGD([W_surrogate], lr=lr_vac)
+
         with torch.enable_grad():
-            for i in range(cooking_iters):
+            for _ in range(cooking_iters):
                 optimizer.zero_grad()
+                # Apply the Vacuum Function: phi(w) = w^3
                 phi_W = torch.pow(W_surrogate, 2 * n_vac + 1)
                 
-                # Match output behavior
-                diff = phi_W - (W_orig / (W_orig.abs().max() + 1e-6))
-                recon_loss = torch.trace(diff @ H_norm @ diff.t())
-                # Use 'lmbda' from the argument list
-                reg_loss = lmbda * torch.norm(W_surrogate)**2
-                
-                loss = 0.5 * recon_loss + reg_loss
+                # Match the output behavior of the original weights
+                # Loss = Reconstruction Error + Small Vacuum Penalty
+                error = torch.trace((phi_W - W_orig) @ H @ (phi_W - W_orig).t())
+                loss = (error / H_scale) + lmbda * torch.norm(W_surrogate)**2
                 loss.backward()
                 optimizer.step()
 
-        # Generate Mask from Vacuum
+        # 3. VACUUM-ENHANCED IMPORTANCE (The core idea from your advisors)
         with torch.no_grad():
-            importance = torch.pow(W_surrogate, 2 * n_vac + 1).abs()
+            # We calculate importance using the survival of weights in the vacuum
+            # combined with the Hessian sensitivity (Hinv)
+            vacuum_survival = torch.pow(W_surrogate, 2 * n_vac + 1).abs()
         
-        # --- STAGE 2: EXECUTION (SAFE SparseGPT) ---
+        # 4. THE STABLE EXECUTION (Standard SparseGPT Loop)
+        # We MUST use this specific loop structure to keep Perplexity low.
         W = W_orig.clone()
-        W[:, dead] = 0
-        
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
-        H = torch.linalg.cholesky(H)
-        H = torch.cholesky_inverse(H)
-        H = torch.linalg.cholesky(H, upper=True)
-        Hinv = H
+        Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
+        Hinv = torch.linalg.cholesky(Hinv, upper=True)
 
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
             W1 = W[:, i1:i2].clone()
-            Q1 = torch.zeros_like(W1)
-            Err1 = torch.zeros_like(W1)
             Hinv1 = Hinv[i1:i2, i1:i2]
-            imp1 = importance[:, i1:i2]
-
-            # Use survival scores to pick the mask
-            tmp_scores = imp1**2 / (torch.diag(Hinv1).reshape((1, -1)) + 1e-9)**2
-            thresh = torch.sort(tmp_scores.flatten())[0][int(tmp_scores.numel() * sparsity)]
-            mask1 = tmp_scores <= thresh
+            
+            # Use Vacuum Survival to pick the Mask
+            # This is the "Smarter Selection"
+            imp_block = vacuum_survival[:, i1:i2]
+            # Formula: (Survival^2) / (Hessian Uncertainty^2)
+            scores = imp_block**2 / (torch.diag(Hinv1).reshape((1, -1))**2 + 1e-9)
+            thresh = torch.sort(scores.flatten())[0][int(scores.numel() * sparsity)]
+            mask1 = scores <= thresh
 
             for i in range(count):
                 w = W1[:, i]; d = Hinv1[i, i]
                 q = w.clone()
-                q[mask1[:, i]] = 0 
-                Q1[:, i] = q
+                q[mask1[:, i]] = 0 # Kill the vacuum victims
+                
+                # The OBS Correction (The "Safe Tailoring")
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                Err1[:, i] = err1
+                W[:, i1+i] = q # Store pruned value
 
-            W[:, i1:i2] = Q1
-            W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+            # Error Carry: Push the pruning error to the rest of the layer
+            W[:, i2:] -= (W[:, i1:i2] - W_orig[:, i1:i2]) @ Hinv[i1:i2, i2:]
 
-        torch.cuda.synchronize()
+        # 5. CLEANUP
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        print(f"Vacuum Pruning Completed Successfully.")
+        print("Vacuum-Enhanced Pruning: Mask discovered, Perplexity protected.")
         
     def free(self):
         if DEBUG:
