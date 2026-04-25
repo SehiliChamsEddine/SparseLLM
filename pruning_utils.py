@@ -165,76 +165,82 @@ class SparseGPT_OPT:
             # print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
     def fasterprune_vacuum(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
-        n_vac=1, lmbda=0.0001, cooking_iters=0, lr_vac=0 # Added unused args to prevent TypeErrors
+        n_vac=1, lmbda=0.0001, cooking_iters=0, lr_vac=0
     ):
-        # 1. SETUP - Work in Float32 for precision
+        """
+        ULTIMATE INTEGRATION: Vacuum-Assisted SparseGPT.
+        Uses the Vacuum as a Tie-Breaker to improve the Pruning Mask.
+        """
+        # 1. SETUP (High Precision)
         W = self.layer.weight.data.clone().float()
         W_orig = W.clone()
         H = self.H.float()
         dead = torch.diag(H) == 0
         H[dead, dead] = 1
         W[:, dead] = 0
-
         tick = time.time()
 
-        # 2. THE VACUUM IMPORTANCE (Image 1 Logic)
-        # We normalize weights so the largest is 1.0. 
-        # This ensures the 'plateau' in your vacuum graph actually aligns with the weights.
-        max_val = torch.max(torch.abs(W)) + 1e-9
-        W_norm = W / max_val
-        
-        # Apply the Vacuum function phi(w) = w^(2n+1)
-        # This creates the 'Attraction to zero' for small normalized weights
-        W_vac = torch.pow(W_norm, 2 * n_vac + 1)
-        
-        # Denormalize back to the original scale
-        W_importance = W_vac * max_val
-
-        # 3. PREPARE HESSIAN
+        # 2. PREPARE HESSIAN INVERSE
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
-        H = torch.linalg.cholesky(H)
-        H = torch.cholesky_inverse(H)
-        H = torch.linalg.cholesky(H, upper=True)
-        Hinv = H
+        Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
+        # This is the sensitivity of each weight according to SparseGPT
+        Hinv_diag = torch.diag(Hinv).reshape((1, -1))
 
-        # 4. SparseGPT BLOCK LOOP
+        # 3. VACUUM DISCOVERY (The Intelligence)
+        # Normalize weights so the Vacuum Function graph (0 to 1) works
+        max_w = W.abs().max() + 1e-9
+        W_norm = W / max_w
+        # Apply Vacuum: phi(w) = w^3. This makes small weights even smaller.
+        W_vac = torch.pow(W_norm, 2 * n_vac + 1)
+        
+        # 4. THE BLENDED SCORE (The Secret to beating 127)
+        # We calculate the SparseGPT score (S1) and the Vacuum score (S2)
+        s_gpt = W**2 / (Hinv_diag**2 + 1e-9)
+        s_vac = (W_vac * max_w)**2 / (Hinv_diag**2 + 1e-9)
+        
+        # We use the Vacuum as a 'Decision Nudge'. 
+        # We take the cube root of the vacuum score so it doesn't destroy the Hessian math.
+        # This helps the model kill 'redundant noise' weights.
+        importance_scores = s_gpt * torch.pow(s_vac + 1e-12, 1/3)
+
+        # 5. SAFE EXECUTION LOOP
+        Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
+        
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
             W1 = W[:, i1:i2].clone()
             Q1 = torch.zeros_like(W1)
             Err1 = torch.zeros_like(W1)
-            Hinv1 = Hinv[i1:i2, i1:i2]
+            Hinv1 = Hinv_cholesky[i1:i2, i1:i2]
             
-            # Use Vacuum-Warped importance to pick the mask
-            # This is the "Smarter Selection"
-            imp_block = W_importance[:, i1:i2]
-            # Pruning Metric: (Vacuumized Weight)^2 / Hessian Uncertainty
-            tmp_metric = imp_block**2 / (torch.diag(Hinv1).reshape((1, -1)) + 1e-9)
-            thresh = torch.sort(tmp_metric.flatten())[0][int(tmp_metric.numel() * sparsity)]
-            mask1 = tmp_metric <= thresh
+            # Select the mask using our BLENDED importance scores
+            imp_block = importance_scores[:, i1:i2]
+            thresh = torch.sort(imp_block.flatten())[0][int(imp_block.numel() * sparsity)]
+            mask1 = imp_block <= thresh
 
             for i in range(count):
                 w = W1[:, i]; d = Hinv1[i, i]
                 q = w.clone()
-                q[mask1[:, i]] = 0 # Kill weights
+                q[mask1[:, i]] = 0 
                 Q1[:, i] = q
 
-                # Correction (The Tailoring)
+                # The 'Tayloring' math that keeps Perplexity low
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 Err1[:, i] = err1
 
             W[:, i1:i2] = Q1
-            W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+            W[:, i2:] -= Err1.matmul(Hinv_cholesky[i1:i2, i2:])
 
-        # 5. FINAL CONVERSION
+        # 6. CONVERT BACK
+        torch.cuda.synchronize()
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        print(f"Vacuum Pruning (n={n_vac}) Done.")
+        print(f"Hybrid Vacuum-GPT Pruning (n={n_vac}) Done.")
         
     def free(self):
         if DEBUG:
