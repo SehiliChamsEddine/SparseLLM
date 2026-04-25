@@ -229,17 +229,32 @@ def opt_sparsellm(model, dataloader, dev, args):
             #         sparsity, prunen=args.prunen, prunem=args.prunem, percdamp=args.percdamp, blocksize=args.blocksize
             #     )
             for name in target_layer_names:
-                print(i, name, "Using Vacuum Pruning")
-                sparsity = args.sparsity
-                # Use our new function instead of gpts[name].fasterprune
-                gpts[name].fasterprune_vacuum(
-                    sparsity, 
-                    prunen=args.prunen, 
-                    prunem=args.prunem, 
-                    blocksize=args.blocksize,
-                    n_vac=3,        # You can tune this
-                    cooking_iters=15 # Start with 15-20 iterations
-                )
+                print(i, name)
+                
+                # CONDITIONAL LOGIC TO SWITCH BETWEEN PRUNING METHODS
+                if args.use_vacuum and name in ['fc1', 'fc2']:
+                    print('Pruning with VACUUM ...')
+                    gpts[name].fasterprune_vacuum(
+                        args.sparsity,
+                        prunen=args.prunen,
+                        prunem=args.prunem,
+                        blocksize=args.blocksize,
+                        percdamp=args.percdamp,
+                        # Pass new vacuum-specific hyperparameters from args
+                        n_vac=args.n_vac,
+                        lmbda=args.lmbda_vac,
+                        cooking_iters=args.cooking_iters,
+                        lr_vac=args.lr_vac
+                    )
+                else:
+                    print('Pruning with SparseGPT ...')
+                    gpts[name].fasterprune(
+                        args.sparsity, 
+                        prunen=args.prunen, 
+                        prunem=args.prunem, 
+                        percdamp=args.percdamp, 
+                        blocksize=args.blocksize
+                    )
 
             ##############
             # optimize p
