@@ -165,65 +165,86 @@ class SparseGPT_OPT:
             # print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
     def fasterprune_vacuum(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
-        n_vac=1, cooking_iters=15
+        n_vac=1, lmbda=0.0001, cooking_iters=15, lr_vac=1e-3 # <--- Names must match model_utils.py
     ):
-        # 1. Get original data
+        """
+        Final Integrated Vacuum Pruning Method
+        """
         W = self.layer.weight.data.clone().float()
-        # Handle Bias: OPT layers have a bias. We must match the output including it.
-        bias = self.layer.bias.data.clone().float() if self.layer.bias is not None else 0
-        
+        W_orig = W.clone()
         tick = time.time()
         H = self.H
+        dead = torch.diag(H) == 0
+        H[dead, dead] = 1
         
-        # 2. THE COOKING PHASE (As shown in your Image 1)
-        # We allow the weights to "drift" into the vacuum
-        W_moving = W.clone().requires_grad_(True)
-        optimizer = torch.optim.Adam([W_moving], lr=1e-3)
+        # --- STAGE 1: SEARCH (SURROGATE) ---
+        W_surrogate = W.clone().requires_grad_(True)
+        # Normalize Hessian to prevent gradients from exploding
+        H_norm = H / (torch.diag(H).max() + 1e-6)
+        optimizer = torch.optim.Adam([W_surrogate], lr=lr_vac)
         
-        # We need to match the original output behavior
-        # In SparseGPT, H = X.T @ X. This allows us to match behavior without needing X.
         with torch.enable_grad():
             for i in range(cooking_iters):
                 optimizer.zero_grad()
-                # phi(w) = w^(2n+1)
-                phi_W = torch.pow(W_moving, 2 * n_vac + 1)
+                phi_W = torch.pow(W_surrogate, 2 * n_vac + 1)
                 
-                # Math: Reconstruction Error using Hessian
-                # diff = phi_W - Original_W
-                diff = phi_W - W
-                # Loss is the error the vacuum causes to the output
-                loss = torch.trace(diff @ H @ diff.t()) 
+                # Match output behavior
+                diff = phi_W - (W_orig / (W_orig.abs().max() + 1e-6))
+                recon_loss = torch.trace(diff @ H_norm @ diff.t())
+                # Use 'lmbda' from the argument list
+                reg_loss = lmbda * torch.norm(W_surrogate)**2
                 
+                loss = 0.5 * recon_loss + reg_loss
                 loss.backward()
                 optimizer.step()
 
-        # 3. THE PRUNING RULE (As shown in your Image 2)
-        # w = 0 if |phi(w)| <= epsilon
+        # Generate Mask from Vacuum
         with torch.no_grad():
-            W_warped = torch.pow(W_moving, 2 * n_vac + 1)
-            # Use the "warped" magnitude to find the mask
-            scores = torch.abs(W_warped)
-            threshold = torch.quantile(scores.flatten(), sparsity)
-            mask = scores > threshold
-
-        # 4. THE RECOVERY (SparseGPT Math)
-        # Now that we have the MASK from the vacuum, we use the original W 
-        # and SparseGPT's Hessian math to fix the survivors.
-        W_final = W.clone()
-        W_final[~mask] = 0 # Apply the Vacuum Mask
+            importance = torch.pow(W_surrogate, 2 * n_vac + 1).abs()
         
-        # Apply the Inverse Hessian correction (Standard SparseGPT loop)
-        # This is the "Safe Surgery" that keeps Perplexity low.
-        Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H + percdamp * torch.eye(H.shape[0], device=H.device)))
+        # --- STAGE 2: EXECUTION (SAFE SparseGPT) ---
+        W = W_orig.clone()
+        W[:, dead] = 0
         
-        # Simple OBS Update
-        for row in range(W_final.shape[0]):
-            # This is the simplified math to adjust survivors
-            # to compensate for the weights we killed in step 3
-            pass # (The block loop from the previous code goes here)
+        damp = percdamp * torch.mean(torch.diag(H))
+        diag = torch.arange(self.columns, device=self.dev)
+        H[diag, diag] += damp
+        H = torch.linalg.cholesky(H)
+        H = torch.cholesky_inverse(H)
+        H = torch.linalg.cholesky(H, upper=True)
+        Hinv = H
 
-        self.layer.weight.data = W_final.half()
-        print(f"Vacuum Pruning: Mask found using phi(w), values fixed using H.")
+        for i1 in range(0, self.columns, blocksize):
+            i2 = min(i1 + blocksize, self.columns)
+            count = i2 - i1
+            W1 = W[:, i1:i2].clone()
+            Q1 = torch.zeros_like(W1)
+            Err1 = torch.zeros_like(W1)
+            Hinv1 = Hinv[i1:i2, i1:i2]
+            imp1 = importance[:, i1:i2]
+
+            # Use survival scores to pick the mask
+            tmp_scores = imp1**2 / (torch.diag(Hinv1).reshape((1, -1)) + 1e-9)**2
+            thresh = torch.sort(tmp_scores.flatten())[0][int(tmp_scores.numel() * sparsity)]
+            mask1 = tmp_scores <= thresh
+
+            for i in range(count):
+                w = W1[:, i]; d = Hinv1[i, i]
+                q = w.clone()
+                q[mask1[:, i]] = 0 
+                Q1[:, i] = q
+                err1 = (w - q) / d
+                W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+                Err1[:, i] = err1
+
+            W[:, i1:i2] = Q1
+            W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+
+        torch.cuda.synchronize()
+        if isinstance(self.layer, transformers.Conv1D):
+            W = W.t()
+        self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
+        print(f"Vacuum Pruning Completed Successfully.")
         
     def free(self):
         if DEBUG:
