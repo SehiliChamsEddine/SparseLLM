@@ -166,16 +166,9 @@ class SparseGPT_OPT:
     def fasterprune_vacuum(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
         n_vac=3, lmbda=0.01, cooking_iters=20, lr_vac=1e-3
-       ):
+    ):
         """
         Vacuum Pruning Implementation for OPT Models.
-        
-        Args:
-            sparsity (float): Target sparsity (e.g., 0.7 for 70%).
-            n_vac (int): The 'n' parameter for the vacuum function w^(2n+1).
-            lmbda (float): Ridge regularization to help weights sink into the vacuum.
-            cooking_iters (int): Gradient steps to polarize weights.
-            lr_vac (float): Learning rate for the vacuum optimization.
         """
         W = self.layer.weight.data.clone()
         if isinstance(self.layer, nn.Conv2d):
@@ -183,7 +176,7 @@ class SparseGPT_OPT:
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
         W = W.float()
-        W_orig = W.clone() # Reference for behavioral matching
+        W_orig = W.clone() 
 
         tick = time.time()
 
@@ -193,38 +186,36 @@ class SparseGPT_OPT:
         W[:, dead] = 0
 
         # --- STAGE 1: VACUUM COOKING ---
-        # We optimize weights locally to see which ones survive the non-linear warping
         W_vac = W.clone().requires_grad_(True)
-        # Adam works best for this local polarization
         optimizer = torch.optim.Adam([W_vac], lr=lr_vac)
         
-        for i in range(cooking_iters):
-            optimizer.zero_grad()
-            
-            # The Vacuum Function: phi(w) = w^(2n+1)
-            phi_W = torch.pow(W_vac, 2 * n_vac + 1)
-            
-            # Reconstruction error using the Hessian H (which represents X^T * X)
-            # Math: ||(phi(W) - W_orig)X||^2 is equivalent to Tr(diff @ H @ diff^T)
-            diff = phi_W - W_orig
-            # We use trace for an efficient matrix-form of the reconstruction loss
-            recon_loss = torch.trace(diff @ H @ diff.t())
-            
-            # Ridge penalty pushes weights toward zero if they aren't useful
-            reg_loss = lmbda * torch.norm(W_vac)**2
-            
-            loss = 0.5 * recon_loss + reg_loss
-            loss.backward()
-            optimizer.step()
+        # FIX: Explicitly re-enable gradients for the optimization loop
+        with torch.enable_grad():
+            for i in range(cooking_iters):
+                optimizer.zero_grad()
+                
+                # The Vacuum Function: phi(w) = w^(2n+1)
+                phi_W = torch.pow(W_vac, 2 * n_vac + 1)
+                
+                # Reconstruction error using the Hessian H
+                diff = phi_W - W_orig
+                recon_loss = torch.trace(diff @ H @ diff.t())
+                
+                # Ridge penalty pushes weights toward zero
+                reg_loss = lmbda * torch.norm(W_vac)**2
+                
+                loss = 0.5 * recon_loss + reg_loss
+                loss.backward()
+                optimizer.step()
         
         # Calculate the final 'importance' based on the warped vacuum weights
+        # No grad needed for masking and correction steps
         with torch.no_grad():
             phi_W_final = torch.pow(W_vac, 2 * n_vac + 1)
         
         # --- STAGE 2: SparseGPT SECOND-ORDER CORRECTION ---
         Losses = torch.zeros(self.rows, device=self.dev)
         
-        # Prepare the Inverse Hessian
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
@@ -233,32 +224,27 @@ class SparseGPT_OPT:
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
 
-        # Process in blocks to maintain memory efficiency
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
 
             W1 = W[:, i1:i2].clone()
-            phi_W1 = phi_W_final[:, i1:i2] # Importance scores from vacuum
+            phi_W1 = phi_W_final[:, i1:i2] 
             
             Q1 = torch.zeros_like(W1)
             Err1 = torch.zeros_like(W1)
             Losses1 = torch.zeros_like(W1)
             Hinv1 = Hinv[i1:i2, i1:i2]
 
-            # Determine the mask using the vacuum-warped weights
-            # This is the "Automatic Discovery" of sparsity
             tmp_score = phi_W1**2 / (torch.diag(Hinv1).reshape((1, -1)))**2
             thresh = torch.sort(tmp_score.flatten())[0][int(tmp_score.numel() * sparsity)]
             mask1 = tmp_score <= thresh
 
-            # Standard SparseGPT column-wise weight update
             for i in range(count):
                 w = W1[:, i]
                 d = Hinv1[i, i]
-                
                 q = w.clone()
-                q[mask1[:, i]] = 0 # Kill weights based on vacuum mask
+                q[mask1[:, i]] = 0 
                 
                 Q1[:, i] = q
                 Losses1[:, i] = (w - q) ** 2 / d ** 2
@@ -278,8 +264,8 @@ class SparseGPT_OPT:
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
             
-        # Put weights back into the layer
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
+        
         
     def free(self):
         if DEBUG:
