@@ -221,12 +221,24 @@ def opt_sparsellm(model, dataloader, dev, args):
                 del tmp_H, tmp_p
                 torch.cuda.empty_cache()
 
+            # for name in target_layer_names:
+            #     print(i, name)
+            #     print('Pruning ...')
+            #     sparsity = args.sparsity
+            #     gpts[name].fasterprune(
+            #         sparsity, prunen=args.prunen, prunem=args.prunem, percdamp=args.percdamp, blocksize=args.blocksize
+            #     )
             for name in target_layer_names:
-                print(i, name)
-                print('Pruning ...')
+                print(i, name, "Using Vacuum Pruning")
                 sparsity = args.sparsity
-                gpts[name].fasterprune(
-                    sparsity, prunen=args.prunen, prunem=args.prunem, percdamp=args.percdamp, blocksize=args.blocksize
+                # Use our new function instead of gpts[name].fasterprune
+                gpts[name].fasterprune_vacuum(
+                    sparsity, 
+                    prunen=args.prunen, 
+                    prunem=args.prunem, 
+                    blocksize=args.blocksize,
+                    n_vac=3,        # You can tune this
+                    cooking_iters=15 # Start with 15-20 iterations
                 )
 
             ##############
