@@ -163,7 +163,111 @@ class SparseGPT_OPT:
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
         # if DEBUG:
             # print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
+    def fasterprune_vacuum(
+        self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01, 
+        n_vac=3, lmbda=0.01, cooking_iters=20
+       ):
+        """
+        New Vacuum Pruning implementation.
+        n_vac: The 'n' in w^(2n+1). Higher means a stronger vacuum.
+        lmbda: The Ridge penalty to help weights sink into the vacuum.
+        cooking_iters: How many gradient steps to take to polarize the weights.
+        """
+        W = self.layer.weight.data.clone()
+        if isinstance(self.layer, nn.Conv2d):
+            W = W.flatten(1)
+        if isinstance(self.layer, transformers.Conv1D):
+            W = W.t()
+        W = W.float()
+        W_orig = W.clone() # Keep reference to dense weights
+        
+        tick = time.time()
 
+        H = self.H
+        dead = torch.diag(H) == 0
+        H[dead, dead] = 1
+        W[:, dead] = 0
+
+        # --- PART A: THE VACUUM COOKING PHASE ---
+        # We optimize W such that phi(W) matches W_orig behavior
+        # Loss = 0.5 * Tr( (phi(W)-W_orig) @ H @ (phi(W)-W_orig).T ) + lambda * ||W||^2
+        W_vac = W.clone().requires_grad_(True)
+        # Use a local optimizer for the cooking phase
+        opt = torch.optim.Adam([W_vac], lr=1e-3)
+        
+        for i in range(cooking_iters):
+            opt.zero_grad()
+            # The Vacuum Function: phi(w) = w^(2n+1)
+            phi_W = torch.pow(W_vac, 2 * n_vac + 1)
+            
+            # Reconstruction error using the Hessian H (Efficient representation of X)
+            # This is mathematically equivalent to ||phi(W)X - W_orig X||^2
+            diff = phi_W - W_orig
+            # Error = Tr(diff @ H @ diff.T)
+            recon_loss = torch.trace(diff @ H @ diff.t())
+            
+            # Ridge penalty to encourage weights to stay small or sink
+            reg_loss = lmbda * torch.norm(W_vac)**2
+            
+            loss = 0.5 * recon_loss + reg_loss
+            loss.backward()
+            opt.step()
+        
+        # After cooking, we calculate the final "warped" importance
+        with torch.no_grad():
+            phi_W_final = torch.pow(W_vac, 2 * n_vac + 1)
+        
+        # --- PART B: STANDARD SparseGPT LOGIC WITH VACUUM MASK ---
+        # Now we proceed with the Hessian inversion to get the correct updates
+        damp = percdamp * torch.mean(torch.diag(H))
+        diag = torch.arange(self.columns, device=self.dev)
+        H[diag, diag] += damp
+        H = torch.linalg.cholesky(H)
+        H = torch.cholesky_inverse(H)
+        H = torch.linalg.cholesky(H, upper=True)
+        Hinv = H
+
+        # Block-wise Pruning
+        for i1 in range(0, self.columns, blocksize):
+            i2 = min(i1 + blocksize, self.columns)
+            count = i2 - i1
+
+            W1 = W[:, i1:i2].clone()
+            # Important: Use the Vacuum results to decide the mask for this block
+            phi_W1 = phi_W_final[:, i1:i2]
+            
+            Q1 = torch.zeros_like(W1)
+            Err1 = torch.zeros_like(W1)
+            Hinv1 = Hinv[i1:i2, i1:i2]
+
+            # Use phi_W magnitudes to determine which weights survive the vacuum
+            # Magnitude Pruning on the "warped" space
+            tmp = phi_W1**2 / (torch.diag(Hinv1).reshape((1, -1)))**2
+            thresh = torch.sort(tmp.flatten())[0][int(tmp.numel() * sparsity)]
+            mask1 = tmp <= thresh
+
+            for i in range(count):
+                w = W1[:, i]
+                d = Hinv1[i, i]
+                
+                # Apply mask derived from vacuum importance
+                q = w.clone()
+                q[mask1[:, i]] = 0
+                
+                Q1[:, i] = q
+                err1 = (w - q) / d
+                W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+                Err1[:, i] = err1
+
+            W[:, i1:i2] = Q1
+            W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+
+        torch.cuda.synchronize()
+        print(f'Vacuum Pruning Done. Time: {time.time() - tick:.2f}s')
+
+        if isinstance(self.layer, transformers.Conv1D):
+            W = W.t()
+        self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
     def free(self):
         if DEBUG:
             self.inp1 = None
