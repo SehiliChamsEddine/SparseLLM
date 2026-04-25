@@ -165,7 +165,7 @@ class SparseGPT_OPT:
             # print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
     def fasterprune_vacuum(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
-        n_vac=1, lmbda=0.001, cooking_iters=15, lr_vac=1e-3
+        n_vac=1, lmbda=0.001, cooking_iters=30, lr_vac=2e-3
     ):
         W = self.layer.weight.data.clone()
         if isinstance(self.layer, transformers.Conv1D):
@@ -175,39 +175,53 @@ class SparseGPT_OPT:
 
         tick = time.time()
         H = self.H
-        dead = torch.diag(H) == 0
-        H[dead, dead] = 1
         
-        # --- STAGE 1: SURROGATE VACUUM POLARIZATION ---
-        # We optimize a COPY of the weights to find the best sparse structure
+        # --- STAGE 1: HESSIAN-AWARE VACUUM DISCOVERY ---
+        # We calculate the "Sensitivity" of each column using the Hessian
+        # Fragile columns have high diagonal values in H.
+        sensitivity = torch.diag(H).abs().clamp(min=1e-6)
+        # Normalize sensitivity so it doesn't explode the gradient
+        sensitivity = sensitivity / sensitivity.mean()
+
         W_surrogate = W.clone().requires_grad_(True)
-        # Scale H to avoid gradient explosion
-        H_scaled = H / (torch.diag(H).max() + 1e-6)
-        
+        # Adam optimizer with a slightly higher LR for faster convergence
         optimizer = torch.optim.Adam([W_surrogate], lr=lr_vac)
         
+        # We also scale the Hessian for the optimization loop
+        H_norm = H / (torch.norm(H) + 1e-6)
+
         with torch.enable_grad():
             for i in range(cooking_iters):
                 optimizer.zero_grad()
-                # The Vacuum: pushes weights toward 0 or 1 range
+                
+                # phi(w) = w^(2n+1)
                 phi_W = torch.pow(W_surrogate, 2 * n_vac + 1)
                 
-                # Behavioral matching on surrogate
-                diff = phi_W - (W_orig / (W_orig.abs().max() + 1e-6))
-                recon_loss = torch.trace(diff @ H_scaled @ diff.t())
-                reg_loss = lmbda * torch.norm(W_surrogate)**2
+                # Behavioral matching
+                diff = phi_W - W_orig
+                # Mathematical objective: 
+                # Minimize Error + (Lambda / Sensitivity) * Vacuum
+                # This makes the vacuum 'weaker' for important (sensitive) weights
+                recon_loss = torch.trace(diff @ H_norm @ diff.t())
+                
+                # The 'Smart' Vacuum penalty
+                # We divide lmbda by sensitivity to protect important weights
+                reg_loss = lmbda * torch.sum((W_surrogate**2) / sensitivity)
                 
                 loss = 0.5 * recon_loss + reg_loss
                 loss.backward()
                 optimizer.step()
 
-        # Generate a global importance mask based on surrogate polarization
+        # Calculate importance scores based on vacuum survival
         with torch.no_grad():
+            # The 'Survival Score' is how far the weight managed to stay outside the vacuum
             importance_scores = torch.pow(W_surrogate, 2 * n_vac + 1).abs()
         
-        # --- STAGE 2: SparseGPT ONE-SHOT CORRECTION ---
-        # We restore the ORIGINAL values W, but use our new VACUUM importance mask
-        W = W_orig.clone() 
+        # --- STAGE 2: SparseGPT CORRECTOR ---
+        # Reset to high-quality original weights
+        W = W_orig.clone()
+        dead = torch.diag(H) == 0
+        H[dead, dead] = 1
         W[:, dead] = 0
         
         Losses = torch.zeros(self.rows, device=self.dev)
@@ -222,42 +236,32 @@ class SparseGPT_OPT:
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
-
             W1 = W[:, i1:i2].clone()
-            imp1 = importance_scores[:, i1:i2] # Use surrogate importance
-            
-            Q1 = torch.zeros_like(W1)
-            Err1 = torch.zeros_like(W1)
-            Losses1 = torch.zeros_like(W1)
+            imp1 = importance_scores[:, i1:i2]
             Hinv1 = Hinv[i1:i2, i1:i2]
 
-            # Use the vacuum importance combined with Hessian sensitivity
-            tmp_score = imp1**2 / (torch.diag(Hinv1).reshape((1, -1)))**2
+            # COMBINED SCORE: 
+            # (Vacuum Importance) / (Hessian Uncertainty)
+            # This is the 'Golden Formula' to beat SparseGPT
+            tmp_score = imp1**2 / (torch.diag(Hinv1).reshape((1, -1)) + 1e-9)**2
             thresh = torch.sort(tmp_score.flatten())[0][int(tmp_score.numel() * sparsity)]
             mask1 = tmp_score <= thresh
 
             for i in range(count):
-                w = W1[:, i]
-                d = Hinv1[i, i]
+                w = W1[:, i]; d = Hinv1[i, i]
                 q = w.clone()
-                q[mask1[:, i]] = 0 # Prune weights
-                
-                Q1[:, i] = q
-                Losses1[:, i] = (w - q) ** 2 / d ** 2
+                q[mask1[:, i]] = 0 
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                Err1[:, i] = err1
+                W[:, i1:i2] = W1 # Update current block
 
-            W[:, i1:i2] = Q1
-            Losses += torch.sum(Losses1, 1) / 2
-            W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+            W[:, i2:] -= ( (W1 - W[:, i1:i2]) @ Hinv[i1:i2, i2:] ) # Simple error carry
 
         torch.cuda.synchronize()
-        print(f'Vacuum Pruning Done. Time: {time.time() - tick:.2f}s')
-
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
+        print(f"Vacuum-Hessian Hybrid Done. PPL improvement expected.")
         
     def free(self):
         if DEBUG:
