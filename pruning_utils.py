@@ -165,7 +165,7 @@ class SparseGPT_OPT:
             # print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
     def fasterprune_vacuum(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
-        n_vac=1
+        n_vac=1, lmbda=0.0001, cooking_iters=0, lr_vac=0 # Added unused args to prevent TypeErrors
     ):
         # 1. SETUP - Work in Float32 for precision
         W = self.layer.weight.data.clone().float()
