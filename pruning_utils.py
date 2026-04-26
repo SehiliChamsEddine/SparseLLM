@@ -168,46 +168,44 @@ class SparseGPT_OPT:
         n_vac=1, lmbda=0.0001, cooking_iters=0, lr_vac=0
     ):
         """
-        ULTIMATE INTEGRATION: Vacuum-Assisted SparseGPT.
-        Uses the Vacuum as a Tie-Breaker to improve the Pruning Mask.
+        NEW IDEA: Redundancy-Aware Vacuum Selection (RAVS).
+        Uses activation correlations to force the Vacuum to kill redundant neurons.
         """
-        # 1. SETUP (High Precision)
+        # 1. SETUP
         W = self.layer.weight.data.clone().float()
         W_orig = W.clone()
         H = self.H.float()
-        dead = torch.diag(H) == 0
-        H[dead, dead] = 1
-        W[:, dead] = 0
         tick = time.time()
 
-        # 2. PREPARE HESSIAN INVERSE
-        damp = percdamp * torch.mean(torch.diag(H))
-        diag = torch.arange(self.columns, device=self.dev)
-        H[diag, diag] += damp
-        Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
-        # This is the sensitivity of each weight according to SparseGPT
-        Hinv_diag = torch.diag(Hinv).reshape((1, -1))
+        # 2. FEATURE REDUNDANCY MAP (The New Part)
+        # H is X^T @ X. The diagonals are the power, the off-diagonals are the correlation.
+        d = torch.diag(H)
+        # Calculate the Correlation Matrix: C_ij = H_ij / sqrt(H_ii * H_jj)
+        correlation_matrix = H / (torch.sqrt(outer_product(d, d)) + 1e-9)
+        # Uniqueness: 1 / Sum of absolute correlations (How 'independent' is this weight?)
+        uniqueness = 1.0 / (torch.sum(torch.abs(correlation_matrix), dim=1) + 1e-9)
+        uniqueness = uniqueness.reshape((1, -1)) # Shape for broadcasting
 
-        # 3. VACUUM DISCOVERY (The Intelligence)
-        # Normalize weights so the Vacuum Function graph (0 to 1) works
+        # 3. VACUUM DISCOVERY
+        # Normalize weights for the vacuum scale (0 to 1)
         max_w = W.abs().max() + 1e-9
         W_norm = W / max_w
-        # Apply Vacuum: phi(w) = w^3. This makes small weights even smaller.
+        # Apply Vacuum: phi(w) = w^3
         W_vac = torch.pow(W_norm, 2 * n_vac + 1)
-        
-        # 4. THE BLENDED SCORE (The Secret to beating 127)
-        # We calculate the SparseGPT score (S1) and the Vacuum score (S2)
-        s_gpt = W**2 / (Hinv_diag**2 + 1e-9)
-        s_vac = (W_vac * max_w)**2 / (Hinv_diag**2 + 1e-9)
-        
-        # We use the Vacuum as a 'Decision Nudge'. 
-        # We take the cube root of the vacuum score so it doesn't destroy the Hessian math.
-        # This helps the model kill 'redundant noise' weights.
-        importance_scores = s_gpt * torch.pow(s_vac + 1e-12, 1/3)
 
-        # 5. SAFE EXECUTION LOOP
-        Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
+        # 4. RAVS IMPORTANCE SCORE
+        # We combine: (Warped Value) * (Uniqueness) / (Hessian Uncertainty)
+        # This protects weights that are 'unique' and 'survive the vacuum'
+        Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H + percdamp * torch.eye(H.shape[0], device=H.device)))
+        h_inv_diag = torch.diag(Hinv).reshape((1, -1))
         
+        # This formula is unique: it penalizes redundancy and rewards vacuum survival
+        importance_scores = ( (W_vac * max_w)**2 * uniqueness ) / (h_inv_diag**2 + 1e-9)
+
+        # 5. SAFE EXECUTION (Standard SparseGPT Math for Stability)
+        W[:, torch.diag(H) == 0] = 0
+        Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
+
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
@@ -216,7 +214,6 @@ class SparseGPT_OPT:
             Err1 = torch.zeros_like(W1)
             Hinv1 = Hinv_cholesky[i1:i2, i1:i2]
             
-            # Select the mask using our BLENDED importance scores
             imp_block = importance_scores[:, i1:i2]
             thresh = torch.sort(imp_block.flatten())[0][int(imp_block.numel() * sparsity)]
             mask1 = imp_block <= thresh
@@ -226,8 +223,6 @@ class SparseGPT_OPT:
                 q = w.clone()
                 q[mask1[:, i]] = 0 
                 Q1[:, i] = q
-
-                # The 'Tayloring' math that keeps Perplexity low
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 Err1[:, i] = err1
@@ -236,11 +231,13 @@ class SparseGPT_OPT:
             W[:, i2:] -= Err1.matmul(Hinv_cholesky[i1:i2, i2:])
 
         # 6. CONVERT BACK
-        torch.cuda.synchronize()
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        print(f"Hybrid Vacuum-GPT Pruning (n={n_vac}) Done.")
+        print(f"RAVS Vacuum Pruning Done. Redundancy suppressed.")
+
+def outer_product(a, b):
+    return torch.matmul(a.unsqueeze(1), b.unsqueeze(0))
         
     def free(self):
         if DEBUG:
