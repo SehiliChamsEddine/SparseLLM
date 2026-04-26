@@ -36,6 +36,12 @@ def main():
         help='Power of the vacuum function w^(2n+1).'
     )
     parser.add_argument(
+        '--n_vac_att', 
+        type=int, 
+        default=1, 
+        help='Power of the vacuum function w^(2n+1).'
+    )
+    parser.add_argument(
         '--lmbda_vac', 
         type=float, 
         default=0.01, 
