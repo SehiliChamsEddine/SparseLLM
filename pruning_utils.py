@@ -165,45 +165,48 @@ class SparseGPT_OPT:
             # print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
     def fasterprune_vacuum(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
-        n_vac=1, lmbda=0.0001, cooking_iters=0, lr_vac=0
+        n_vac=1, lmbda=0, cooking_iters=0, lr_vac=0
     ):
         """
-        RAVS v2: Information-Guided Vacuum Pruning.
-        Refined denominator and log-uniqueness to beat the 127 baseline.
+        STABILIZED RAVS: The Multiplier Strategy.
+        Uses the Vacuum and Uniqueness to 'nudge' the SparseGPT rank.
+        This prevents the '301 PPL' breaking by keeping the Hessian in control.
         """
-        # 1. SETUP
+        # 1. SETUP (Float32 for precision)
         W = self.layer.weight.data.clone().float()
         W_orig = W.clone()
         H = self.H.float()
         tick = time.time()
 
-        # 2. CALCULATE UNIQUENESS (Log-Scaled for stability)
-        # We want to know if an input is a 'duplicate'
+        # 2. CALCULATE THE "NUDGES" (The Intelligence)
+        # Uniqueness Nudge: How independent is this feature?
         d = torch.diag(H)
-        # Correlation matrix
         C = H / (torch.sqrt(torch.outer(d, d)) + 1e-9)
-        # Sum of correlations (Redundancy count)
-        redundancy_count = torch.sum(torch.abs(C), dim=1)
-        # Uniqueness Prior: Use log to keep the range small (e.g., 1.0 to 0.8)
-        uniqueness_prior = 1.0 / torch.log1p(redundancy_count + 1e-9)
-        uniqueness_prior = (uniqueness_prior / uniqueness_prior.max()).reshape((1, -1))
+        redundancy = torch.sum(torch.abs(C), dim=1)
+        # We use a soft-multiplier (0.5 to 1.0) so we don't destroy the score
+        u_multiplier = 1.0 / torch.sqrt(redundancy + 1e-9)
+        u_multiplier = (u_multiplier / u_multiplier.max()).reshape((1, -1))
 
-        # 3. VACUUM MODULATION
-        # Scale to 0-1 for the vacuum logic
+        # Vacuum Nudge: How well does it survive the warping?
         max_w = W.abs().max() + 1e-9
-        # phi(w) = w^3. We use this to 'dim' the importance of noise.
-        W_warped = torch.pow(W / max_w, 2 * n_vac + 1) * max_w
+        # We use a soft-vacuum nudge: (normalized weight)^n
+        v_multiplier = torch.pow(W.abs() / max_w, n_vac)
 
-        # 4. THE MODULATED OBS METRIC
-        # We use the EXACT SparseGPT denominator [Hinv_ii]
-        Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H + percdamp * torch.eye(H.shape[0], device=H.device)))
+        # 3. PREPARE STABLE HESSIAN INVERSE
+        damp = percdamp * torch.mean(torch.diag(H))
+        diag = torch.arange(self.columns, device=self.dev)
+        H[diag, diag] += damp
+        Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
         h_inv_diag = torch.diag(Hinv).reshape((1, -1))
-        
-        # CORE FORMULA: Standard OBS * Vacuum_Survival * Uniqueness
-        # This is the most balanced version of your new ideas.
-        importance_scores = (W_warped**2 / (h_inv_diag + 1e-9)) * uniqueness_prior
 
-        # 5. EXECUTION (Safe SparseGPT loop)
+        # 4. THE INTEGRATED SCORE (Foundation + Nudges)
+        # Foundation: Standard SparseGPT OBS Score (w^2 / Hinv)
+        # Nudges: Vacuum survival and Information Uniqueness
+        # This keeps the Hessian (Safety) as the main driver.
+        base_score = W**2 / (h_inv_diag + 1e-9)
+        importance_scores = base_score * v_multiplier * u_multiplier
+
+        # 5. SAFE SparseGPT EXECUTION (The Correct Error-Carry)
         W[:, torch.diag(H) == 0] = 0
         Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
 
@@ -215,6 +218,7 @@ class SparseGPT_OPT:
             Err1 = torch.zeros_like(W1)
             Hinv1 = Hinv_cholesky[i1:i2, i1:i2]
             
+            # Select Mask using our Integrated Intelligence
             imp_block = importance_scores[:, i1:i2]
             thresh = torch.sort(imp_block.flatten())[0][int(imp_block.numel() * sparsity)]
             mask1 = imp_block <= thresh
@@ -224,18 +228,21 @@ class SparseGPT_OPT:
                 q = w.clone()
                 q[mask1[:, i]] = 0 
                 Q1[:, i] = q
+
+                # This correction math is the 'Gold Standard' from the SparseGPT paper
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 Err1[:, i] = err1
 
             W[:, i1:i2] = Q1
+            # Push error to remaining weights to preserve Perplexity
             W[:, i2:] -= Err1.matmul(Hinv_cholesky[i1:i2, i2:])
 
-        # 6. CONVERT BACK
+        # 6. CONVERT TO MODEL DTYPE
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        print(f"IGVP (Information-Guided Vacuum) Done.")
+        print(f"Stabilized RAVS (n={n_vac}) Done.")
     def free(self):
         if DEBUG:
             self.inp1 = None
