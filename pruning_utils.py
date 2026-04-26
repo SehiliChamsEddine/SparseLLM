@@ -164,20 +164,22 @@ class SparseGPT_OPT:
         # if DEBUG:
             # print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
     def fasterprune_vacuum(
-        self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
+        self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.05,
         n_vac=3, lmbda=0, cooking_iters=0, lr_vac=0
     ):
         """
-        RAVS v4: THE RECORD BREAKER.
-        Uses a Geometric Blend (sqrt) to balance Vacuum intelligence and Hessian safety.
+        RAVS FINAL (Memory Optimized): The Record-Breaker.
+        Anchor Logic (0.5 Blend) + High Damping (0.05) + Anti-OOM Protections.
         """
         W = self.layer.weight.data.clone().float()
+        W_orig = W.clone()
         H = self.H.float()
         dev = self.dev
         
         tick = time.time()
+        print(f"  [1/4] Discovering Redundancy (Chunked Memory Safe)...")
 
-        # 1.1 Uniqueness (Chunked)
+        # 1. CHUNKED UNIQUENESS (Anti-OOM)
         d = torch.diag(H).abs()
         d_sqrt = torch.sqrt(d) + 1e-9
         redundancy = torch.zeros(self.columns, device=dev)
@@ -188,48 +190,45 @@ class SparseGPT_OPT:
             redundancy[i:end] = torch.sum(corr_chunk, dim=1)
             del h_chunk, corr_chunk
         
-        uniqueness = 1.0 / torch.log1p(redundancy + 1.0)
+        uniqueness = (1.0 / torch.log1p(redundancy + 1.0))
         uniqueness = (uniqueness / uniqueness.max()).reshape((1, -1))
         uniqueness = torch.clamp(uniqueness, min=0.9)
+        del redundancy
 
-        # 1.2 Row-Wise Vacuum Contrast
+        # 2. ROW-WISE VACUUM (Anchor Strategy)
         row_max = torch.max(torch.abs(W), dim=1, keepdim=True)[0] + 1e-9
         v_multiplier = torch.pow(torch.abs(W) / row_max, n_vac)
 
-        # 1.3 Hessian Inverse (Safety)
+        # 3. RANKING & MASKING (Anti-OOM Sampling)
+        print(f"  [2/4] Ranking Weights and Building Mask...")
         damp = percdamp * torch.mean(d)
         diag = torch.arange(self.columns, device=dev)
         H[diag, diag] += damp
         Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
         h_inv_diag = torch.diag(Hinv).reshape((1, -1))
-
-        # 1.4 THE BALANCED SCORE (THE CHANGE IS HERE)
-        # We blend the Vacuum and Uniqueness with a square root (power of 0.5)
-        # This makes the Vacuum an 'Advisor' instead of a 'Boss'.
-       # --- THE FINAL TUNING: The Goldilocks Blend ---
-        # 0.35 is the 'Magic Number' for balancing non-linear vacuuming 
-        # with linear Hessian safety.
-        balanced_advisor = torch.pow(v_multiplier * uniqueness + 1e-12, 0.35)
         
-        # Combined Score
-        importance_scores = (W**2 / (h_inv_diag + 1e-9)) * balanced_advisor
-        
-        del v_multiplier, uniqueness, balanced_advisor
+        # Calculate scores using the Successful Anchor Blend (0.5 power)
+        importance_scores = (W**2 / (h_inv_diag + 1e-9)) * torch.sqrt(v_multiplier * uniqueness + 1e-12)
+        del v_multiplier, uniqueness
 
-        # 1.5 Create Mask
-        thresh = torch.sort(importance_scores.flatten())[0][int(importance_scores.numel() * sparsity)]
+        # Sampling Trick for huge layers to prevent sort-OOM
+        if importance_scores.numel() > 10_000_000:
+            sample = importance_scores.view(-1)[::10] # 10% sample
+            thresh = torch.quantile(sample, sparsity)
+        else:
+            thresh = torch.sort(importance_scores.flatten())[0][int(importance_scores.numel() * sparsity)]
+        
         global_mask = importance_scores > thresh
         del importance_scores, thresh
 
-        # 2. THE STABLE CORRECTION LOOP (Industry Standard)
-        Losses = torch.zeros(self.rows, device=dev)
+        # 4. CORRECTION SURGERY (Industry Standard)
+        print(f"  [3/4] Performing Correction Surgery...")
+        Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
+
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
             W1 = W[:, i1:i2].clone()
-            Q1 = torch.zeros_like(W1)
-            Err1 = torch.zeros_like(W1)
-            Losses1 = torch.zeros_like(W1)
             Hinv1 = Hinv[i1:i2, i1:i2]
             mask1 = ~global_mask[:, i1:i2] 
 
@@ -237,19 +236,20 @@ class SparseGPT_OPT:
                 w = W1[:, i]; d = Hinv1[i, i]
                 q = w.clone()
                 q[mask1[:, i]] = 0 
-                Q1[:, i] = q
-                Losses1[:, i] = (w - q) ** 2 / d ** 2
+                
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                Err1[:, i] = err1
+                W[:, i1+i] = q
 
-            W[:, i1:i2] = Q1
-            W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+            W[:, i2:] -= (W[:, i1:i2] - W1) @ Hinv_cholesky[i1:i2, i2:]
+            torch.cuda.empty_cache()
 
+        # 5. CONVERT BACK
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        print(f"  Success: Record-Breaker Balance Applied.")
+        
+        print(f"  [4/4] Success: Layer Pruned in {time.time() - tick:.2f}s")
         
     def free(self):
         if DEBUG:
