@@ -125,7 +125,7 @@ def opt_sparsellm(model, dataloader, dev, args):
                     prunem=args.prunem,
                     blocksize=args.blocksize,
                     percdamp=args.percdamp,
-                    n_vac=args.n_vac,
+                    n_vac=args.n_vac_att,
                     lmbda=args.lmbda_vac,   # Passes as 'lmbda'
                     cooking_iters=args.cooking_iters,
                     lr_vac=args.lr_vac      # Passes as 'lr_vac'
