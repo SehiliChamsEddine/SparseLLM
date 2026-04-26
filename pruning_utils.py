@@ -235,6 +235,12 @@ class SparseGPT_OPT:
             W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
         print(f"RAVS Vacuum Pruning Done. Redundancy suppressed.")
+    def free(self):
+        if DEBUG:
+            self.inp1 = None
+            self.out1 = None
+        self.H = None
+        torch.cuda.empty_cache()
 
 def outer_product(a, b):
     return torch.matmul(a.unsqueeze(1), b.unsqueeze(0))
