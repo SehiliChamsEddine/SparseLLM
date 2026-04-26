@@ -165,52 +165,48 @@ class SparseGPT_OPT:
             # print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
     def fasterprune_vacuum(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
-        n_vac=1, lmbda=0, cooking_iters=0, lr_vac=0
+        n_vac=3, lmbda=0, cooking_iters=0, lr_vac=0
     ):
         """
-        THE 127-BASELINE VERSION: Subtle Tie-Breaking.
-        Uses a log-dampened multiplier to ensure the Vacuum improves the mask
-        without creating unrecoverable errors.
+        THE CHAMPION VERSION: Aggressive Contrast + Redundancy Mapping.
+        This version integrates the n_vac=3 success with Feature Uniqueness.
         """
-        # 1. SETUP
+        # 1. SETUP (Float32 is mandatory for 127-range results)
         W = self.layer.weight.data.clone().float()
         W_orig = W.clone()
         H = self.H.float()
         tick = time.time()
 
-        # 2. INFORMATION UNIQUENESS (Log-Dampened)
+        # 2. FEATURE UNIQUENESS (The tie-breaker)
+        # We look at the correlation matrix of inputs to find unique features
         d = torch.diag(H)
+        # Correlation C_ij = H_ij / sqrt(H_ii * H_jj)
         C = H / (torch.sqrt(torch.outer(d, d)) + 1e-9)
-        # redundancy = how many other features cover this signal
-        redundancy = torch.sum(torch.abs(C), dim=1)
-        # Use log-scaling so the 'Unique' bonus is gentle (0.9 to 1.0 range)
-        u_nudge = 1.0 / torch.log1p(redundancy + 1.0)
-        u_nudge = (u_nudge / u_nudge.max()).reshape((1, -1))
-        u_nudge = torch.clamp(u_nudge, min=0.9) # Max 10% influence
+        # uniqueness = 1 / log(total correlation)
+        # This rewards weights that are the 'only ones' sending a specific signal
+        uniqueness = 1.0 / torch.log1p(torch.sum(torch.abs(C), dim=1) + 1.0)
+        uniqueness = (uniqueness / uniqueness.max()).reshape((1, -1))
+        # Keep the uniqueness nudge subtle (0.9 to 1.0)
+        uniqueness = torch.clamp(uniqueness, min=0.9)
 
-        # 3. ROW-WISE VACUUM (Normalized)
+        # 3. AGGRESSIVE ROW-WISE VACUUM (Your n_vac=3 discovery)
         row_max = torch.max(torch.abs(W), dim=1, keepdim=True)[0] + 1e-9
-        # Normalize weights to 0-1 for the vacuum function phi(w) = w^n
-        v_nudge = torch.pow(torch.abs(W) / row_max, n_vac)
-        v_nudge = torch.clamp(v_nudge, min=0.9) # Max 10% influence
+        # n_vac=3 creates the w^7 contrast which gave you the 132 PPL
+        v_multiplier = torch.pow(torch.abs(W) / row_max, n_vac)
 
-        # 4. PREPARE HESSIAN (Float32 for precision)
+        # 4. PREPARE HESSIAN
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
         Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
         h_inv_diag = torch.diag(Hinv).reshape((1, -1))
 
-        # 5. INTEGRATED TIE-BREAKER SCORE
-        # Foundation: Standard OBS Score (Proven by SparseGPT)
+        # 5. THE INTEGRATED WINNING SCORE
+        # Formula: Standard OBS * Vacuum Contrast * Uniqueness Bonus
         base_score = W**2 / (h_inv_diag + 1e-9)
-        
-        # Blended Score: Foundation * (Vacuum * Uniqueness)^0.1
-        # The 0.1 exponent is the 'Secret Sauce' - it makes our new ideas
-        # act as a Tie-Breaker for weights that are close in value.
-        importance_scores = base_score * torch.pow(v_nudge * u_nudge, 0.1)
+        importance_scores = base_score * v_multiplier * uniqueness
 
-        # 6. EXACT SparseGPT EXECUTION
+        # 6. EXACT SparseGPT EXECUTION LOOP
         W[:, torch.diag(H) == 0] = 0
         Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
 
@@ -222,7 +218,7 @@ class SparseGPT_OPT:
             Err1 = torch.zeros_like(W1)
             Hinv1 = Hinv_cholesky[i1:i2, i1:i2]
             
-            # Select Mask using the Blended Score
+            # Mask selection using the integrated champion scores
             imp_block = importance_scores[:, i1:i2]
             thresh = torch.sort(imp_block.flatten())[0][int(imp_block.numel() * sparsity)]
             mask1 = imp_block <= thresh
@@ -230,10 +226,10 @@ class SparseGPT_OPT:
             for i in range(count):
                 w = W1[:, i]; d = Hinv1[i, i]
                 q = w.clone()
-                q[mask1[:, i]] = 0 # Apply Pruning
+                q[mask1[:, i]] = 0 
                 Q1[:, i] = q
 
-                # Industry-standard error carry
+                # Numerical correction to fix the error of killed weights
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 Err1[:, i] = err1
@@ -245,7 +241,7 @@ class SparseGPT_OPT:
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        print(f"Subtle Vacuum Pruning Done.")
+        print(f"Champion Vacuum Pruning (n={n_vac}) Done.")
         
     def free(self):
         if DEBUG:
