@@ -168,10 +168,10 @@ class SparseGPT_OPT:
         n_vac=3, lmbda=0, cooking_iters=0, lr_vac=0
     ):
         """
-        MEMORY-EFFICIENT CHAMPION VERSION WITH PROGRESS LOGS.
+        FIXED MEMORY-EFFICIENT CHAMPION.
+        Uses chunked math for the mask, but original SparseGPT loop for the surgery.
         """
         W = self.layer.weight.data.clone().float()
-        W_orig = W.clone()
         H = self.H.float()
         dev = self.dev
         
@@ -186,15 +186,14 @@ class SparseGPT_OPT:
         for i in range(0, self.columns, 512):
             end = min(i + 512, self.columns)
             h_chunk = H[i:end, :]
+            # Memory-safe broadcast correlation
             corr_chunk = torch.abs(h_chunk) / (d_sqrt[i:end].unsqueeze(1) * d_sqrt.unsqueeze(0))
             redundancy[i:end] = torch.sum(corr_chunk, dim=1)
-            if i % 2048 == 0:
-                print(f"    - Processed {i}/{self.columns} columns...")
             del h_chunk, corr_chunk
         
         uniqueness = 1.0 / torch.log1p(redundancy + 1.0)
         uniqueness = (uniqueness / uniqueness.max()).reshape((1, -1))
-        uniqueness = torch.clamp(uniqueness, min=0.9)
+        uniqueness = torch.clamp(uniqueness, min=0.9) # Nudge, don't destroy
         del redundancy
 
         # 2. ROW-WISE VACUUM NUDGE
@@ -207,50 +206,58 @@ class SparseGPT_OPT:
         damp = percdamp * torch.mean(d)
         diag = torch.arange(self.columns, device=dev)
         H[diag, diag] += damp
-        Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
+        H = torch.linalg.cholesky(H)
+        H = torch.cholesky_inverse(H)
+        H = torch.linalg.cholesky(H, upper=True)
+        Hinv = H
         h_inv_diag = torch.diag(Hinv).reshape((1, -1))
-        del d, diag
 
         # 4. MEMORY-EFFICIENT SCORING
-        print(f"  [4/5] Ranking weights and finding threshold...")
-        importance_scores = (W**2 / (h_inv_diag + 1e-9)) * v_multiplier * uniqueness
+        print(f"  [4/5] Ranking weights and finding mask...")
+        # (W^2 / Hinv) * Vacuum * Uniqueness
+        # This determines the MASK (the 0s and 1s)
+        importance_scores = (W**2 / (h_inv_diag**2 + 1e-9)) * v_multiplier * uniqueness
         del v_multiplier 
         
-        if importance_scores.numel() > 10_000_000:
-            sample = importance_scores.view(-1)[::10]
-            thresh = torch.quantile(sample, sparsity)
-        else:
-            thresh = torch.sort(importance_scores.flatten())[0][int(importance_scores.numel() * sparsity)]
-        
-        print(f"    - Sparsity Threshold: {thresh.item():.6e}")
-        global_mask = importance_scores > thresh
+        # Sort to find threshold
+        thresh = torch.sort(importance_scores.flatten())[0][int(importance_scores.numel() * sparsity)]
+        global_mask = importance_scores <= thresh
         del importance_scores, thresh
 
-        # 5. EXECUTION LOOP
+        # 5. EXECUTION LOOP (Standard SparseGPT Math)
         print(f"  [5/5] Performing Correction Surgery...")
-        W[:, torch.diag(H) == 0] = 0
-        Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
-
+        # We process column by column to push errors correctly
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
+
             W1 = W[:, i1:i2].clone()
-            Hinv1 = Hinv_cholesky[i1:i2, i1:i2]
-            mask1 = ~global_mask[:, i1:i2] 
+            Q1 = torch.zeros_like(W1)
+            Err1 = torch.zeros_like(W1)
+            Hinv1 = Hinv[i1:i2, i1:i2]
+            mask1 = global_mask[:, i1:i2]
 
             for i in range(count):
-                w = W1[:, i]; d = Hinv1[i, i]
+                w = W1[:, i]
+                d = Hinv1[i, i]
+                
                 q = w.clone()
-                q[mask1[:, i]] = 0 
+                q[mask1[:, i]] = 0 # Prune
+                
+                Q1[:, i] = q
+                # Error calculation: (Actual - Pruned) / Sensitivity
                 err1 = (w - q) / d
+                # Update the remaining weights in this block
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                W[:, i1+i] = q
+                Err1[:, i] = err1
 
-            W[:, i2:] -= (W[:, i1:i2] - W_orig[:, i1:i2]) @ Hinv_cholesky[i1:i2, i2:]
+            # Update the main weight matrix for this block
+            W[:, i1:i2] = Q1
+            # PUSH ERROR: Push the block error to all weights to the right
+            W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
             
             if i1 % 1024 == 0:
                 print(f"    - Surgery progress: {i1}/{self.columns} columns corrected...")
-            torch.cuda.empty_cache()
 
         # 6. FINAL CLEANUP
         if isinstance(self.layer, transformers.Conv1D):
