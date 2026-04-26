@@ -173,7 +173,6 @@ class SparseGPT_OPT:
         """
         # 1. SETUP (Float32 is mandatory for 127-range results)
         W = self.layer.weight.data.clone().float()
-        W_orig = W.clone()
         H = self.H.float()
         tick = time.time()
 
@@ -185,6 +184,8 @@ class SparseGPT_OPT:
         # uniqueness = 1 / log(total correlation)
         # This rewards weights that are the 'only ones' sending a specific signal
         uniqueness = 1.0 / torch.log1p(torch.sum(torch.abs(C), dim=1) + 1.0)
+
+        del C
         uniqueness = (uniqueness / uniqueness.max()).reshape((1, -1))
         # Keep the uniqueness nudge subtle (0.9 to 1.0)
         uniqueness = torch.clamp(uniqueness, min=0.9)
@@ -200,16 +201,22 @@ class SparseGPT_OPT:
         H[diag, diag] += damp
         Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
         h_inv_diag = torch.diag(Hinv).reshape((1, -1))
-
+            
         # 5. THE INTEGRATED WINNING SCORE
         # Formula: Standard OBS * Vacuum Contrast * Uniqueness Bonus
         base_score = W**2 / (h_inv_diag + 1e-9)
         importance_scores = base_score * v_multiplier * uniqueness
-
+        del base_score , v_multiplier , uniqueness
+        # --- NEW OPTIMIZATION: Convert scores to a small Boolean mask ---
+        thresh = torch.sort(importance_scores.flatten())[0][int(importance_scores.numel() * sparsity)]
+        global_mask = importance_scores > thresh
+        del importance_scores # <--- GIANT SAVINGS: Deletes scores before the loop starts
+        
         # 6. EXACT SparseGPT EXECUTION LOOP
         W[:, torch.diag(H) == 0] = 0
+        del H    
         Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
-
+        del Hinv
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
@@ -219,9 +226,7 @@ class SparseGPT_OPT:
             Hinv1 = Hinv_cholesky[i1:i2, i1:i2]
             
             # Mask selection using the integrated champion scores
-            imp_block = importance_scores[:, i1:i2]
-            thresh = torch.sort(imp_block.flatten())[0][int(imp_block.numel() * sparsity)]
-            mask1 = imp_block <= thresh
+            mask1 = ~global_mask[:, i1:i2] 
 
             for i in range(count):
                 w = W1[:, i]; d = Hinv1[i, i]
@@ -236,7 +241,8 @@ class SparseGPT_OPT:
 
             W[:, i1:i2] = Q1
             W[:, i2:] -= Err1.matmul(Hinv_cholesky[i1:i2, i2:])
-
+            del W1, Hinv1, mask1
+        del Hinv_cholesky, global_mask
         # 7. CONVERT BACK
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
