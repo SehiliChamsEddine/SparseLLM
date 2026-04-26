@@ -291,11 +291,15 @@ def opt_sparsellm(model, dataloader, dev, args):
             # Activation formulate
             bias = subset['fc2'].bias.unsqueeze(1).expand(-1, Y.size(-1))
             m3 = beta * torch.matmul(next_weight.T, Y - bias)
+
+            del  next_weight , bias
+            torch.cuda.empty_cache()
+            
             m4 = gamma * layer_nl_output
             af = m3 + m4
             # ADD THESE LINES IMMEDIATELY:
-            del m3, m4, layer_nl_output , bias , next_weight
-            torch.cuda.empty_cache()
+            del m3, m4, layer_nl_output 
+            
             
             p = torch.matmul(av, af)
 
