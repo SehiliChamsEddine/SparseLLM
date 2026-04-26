@@ -129,11 +129,11 @@ def opt_sparsellm(model, dataloader, dev, args):
                 #     lmbda=args.lmbda_vac,   # Passes as 'lmbda'
                 #     cooking_iters=args.cooking_iters,
                 #     lr_vac=args.lr_vac      # Passes as 'lr_vac'
-                                        )
+                                        # )
                 # else:
                 print('Pruning with SparseGPT ...')
                 gpts[name].fasterprune(
-                sparsity, prunen=args.prunen, prunem=args.prunem, percdamp=args.percdamp, blocksize=args.blocksize
+                    sparsity, prunen=args.prunen, prunem=args.prunem, percdamp=args.percdamp, blocksize=args.blocksize
                 )
                    
                 
