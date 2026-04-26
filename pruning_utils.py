@@ -163,92 +163,174 @@ class SparseGPT_OPT:
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
         # if DEBUG:
             # print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
+    # def fasterprune_vacuum(
+    #     self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
+    #     n_vac=3, lmbda=0, cooking_iters=0, lr_vac=0
+    # ):
+    #     """
+    #     THE CHAMPION VERSION: Aggressive Contrast + Redundancy Mapping.
+    #     This version integrates the n_vac=3 success with Feature Uniqueness.
+    #     """
+    #     # 1. SETUP (Float32 is mandatory for 127-range results)
+    #     W = self.layer.weight.data.clone().float()
+    #     H = self.H.float()
+    #     tick = time.time()
+
+    #     # 2. FEATURE UNIQUENESS (The tie-breaker)
+    #     # We look at the correlation matrix of inputs to find unique features
+    #     d = torch.diag(H)
+    #     # Correlation C_ij = H_ij / sqrt(H_ii * H_jj)
+    #     C = H / (torch.sqrt(torch.outer(d, d)) + 1e-9)
+    #     # uniqueness = 1 / log(total correlation)
+    #     # This rewards weights that are the 'only ones' sending a specific signal
+    #     uniqueness = 1.0 / torch.log1p(torch.sum(torch.abs(C), dim=1) + 1.0)
+
+    #     del C
+    #     uniqueness = (uniqueness / uniqueness.max()).reshape((1, -1))
+    #     # Keep the uniqueness nudge subtle (0.9 to 1.0)
+    #     uniqueness = torch.clamp(uniqueness, min=0.9)
+
+    #     # 3. AGGRESSIVE ROW-WISE VACUUM (Your n_vac=3 discovery)
+    #     row_max = torch.max(torch.abs(W), dim=1, keepdim=True)[0] + 1e-9
+    #     # n_vac=3 creates the w^7 contrast which gave you the 132 PPL
+    #     v_multiplier = torch.pow(torch.abs(W) / row_max, n_vac)
+
+    #     # 4. PREPARE HESSIAN
+    #     damp = percdamp * torch.mean(torch.diag(H))
+    #     diag = torch.arange(self.columns, device=self.dev)
+    #     H[diag, diag] += damp
+    #     Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
+    #     h_inv_diag = torch.diag(Hinv).reshape((1, -1))
+            
+    #     # 5. THE INTEGRATED WINNING SCORE
+    #     # Formula: Standard OBS * Vacuum Contrast * Uniqueness Bonus
+    #     base_score = W**2 / (h_inv_diag + 1e-9)
+    #     importance_scores = base_score * v_multiplier * uniqueness
+    #     del base_score , v_multiplier , uniqueness
+    #     # --- NEW OPTIMIZATION: Convert scores to a small Boolean mask ---
+    #     thresh = torch.sort(importance_scores.flatten())[0][int(importance_scores.numel() * sparsity)]
+    #     global_mask = importance_scores > thresh
+    #     del importance_scores # <--- GIANT SAVINGS: Deletes scores before the loop starts
+        
+    #     # 6. EXACT SparseGPT EXECUTION LOOP
+    #     W[:, torch.diag(H) == 0] = 0
+    #     del H    
+    #     Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
+    #     del Hinv
+    #     for i1 in range(0, self.columns, blocksize):
+    #         i2 = min(i1 + blocksize, self.columns)
+    #         count = i2 - i1
+    #         W1 = W[:, i1:i2].clone()
+    #         Q1 = torch.zeros_like(W1)
+    #         Err1 = torch.zeros_like(W1)
+    #         Hinv1 = Hinv_cholesky[i1:i2, i1:i2]
+            
+    #         # Mask selection using the integrated champion scores
+    #         mask1 = ~global_mask[:, i1:i2] 
+
+    #         for i in range(count):
+    #             w = W1[:, i]; d = Hinv1[i, i]
+    #             q = w.clone()
+    #             q[mask1[:, i]] = 0 
+    #             Q1[:, i] = q
+
+    #             # Numerical correction to fix the error of killed weights
+    #             err1 = (w - q) / d
+    #             W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+    #             Err1[:, i] = err1
+
+    #         W[:, i1:i2] = Q1
+    #         W[:, i2:] -= Err1.matmul(Hinv_cholesky[i1:i2, i2:])
+    #         del W1, Hinv1, mask1
+    #     del Hinv_cholesky, global_mask
+    #     # 7. CONVERT BACK
+    #     if isinstance(self.layer, transformers.Conv1D):
+    #         W = W.t()
+    #     self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
+    #     print(f"Champion Vacuum Pruning (n={n_vac}) Done.")
     def fasterprune_vacuum(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
         n_vac=3, lmbda=0, cooking_iters=0, lr_vac=0
     ):
-        """
-        THE CHAMPION VERSION: Aggressive Contrast + Redundancy Mapping.
-        This version integrates the n_vac=3 success with Feature Uniqueness.
-        """
-        # 1. SETUP (Float32 is mandatory for 127-range results)
+        # 1. SETUP & MEMORY INITIALIZATION
         W = self.layer.weight.data.clone().float()
         H = self.H.float()
+        dead_neurons = torch.diag(H) == 0
+        dev = self.dev
         tick = time.time()
 
-        # 2. FEATURE UNIQUENESS (The tie-breaker)
-        # We look at the correlation matrix of inputs to find unique features
+        # 2. FEATURE UNIQUENESS (Chunked for Memory)
         d = torch.diag(H)
-        # Correlation C_ij = H_ij / sqrt(H_ii * H_jj)
         C = H / (torch.sqrt(torch.outer(d, d)) + 1e-9)
-        # uniqueness = 1 / log(total correlation)
-        # This rewards weights that are the 'only ones' sending a specific signal
         uniqueness = 1.0 / torch.log1p(torch.sum(torch.abs(C), dim=1) + 1.0)
-
         del C
         uniqueness = (uniqueness / uniqueness.max()).reshape((1, -1))
-        # Keep the uniqueness nudge subtle (0.9 to 1.0)
         uniqueness = torch.clamp(uniqueness, min=0.9)
 
-        # 3. AGGRESSIVE ROW-WISE VACUUM (Your n_vac=3 discovery)
-        row_max = torch.max(torch.abs(W), dim=1, keepdim=True)[0] + 1e-9
-        # n_vac=3 creates the w^7 contrast which gave you the 132 PPL
-        v_multiplier = torch.pow(torch.abs(W) / row_max, n_vac)
+        # 3. PIECE-WISE VACUUM (The property: phi(x)=x for x >= 1)
+        # We define 'Signal' as the top 10% of weights in each row.
+        # Everything below the 90th percentile is 'Noise' subject to the vacuum.
+        row_threshold = torch.quantile(torch.abs(W), 0.9, dim=1, keepdim=True)
+        # Normalize weights so that the threshold is 1.0
+        W_norm = torch.abs(W) / (row_threshold + 1e-9)
+        
+        # Apply the Property:
+        # If w_norm >= 1.0: v_multiplier = w_norm (Linear Zone)
+        # If w_norm < 1.0: v_multiplier = w_norm^n (Vacuum Zone)
+        v_multiplier = torch.where(W_norm >= 1.0, W_norm, torch.pow(W_norm, n_vac))
+        del W_norm, row_threshold
 
         # 4. PREPARE HESSIAN
-        damp = percdamp * torch.mean(torch.diag(H))
-        diag = torch.arange(self.columns, device=self.dev)
+        damp = percdamp * torch.mean(d)
+        diag = torch.arange(self.columns, device=dev)
         H[diag, diag] += damp
         Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
         h_inv_diag = torch.diag(Hinv).reshape((1, -1))
+        del H
             
-        # 5. THE INTEGRATED WINNING SCORE
-        # Formula: Standard OBS * Vacuum Contrast * Uniqueness Bonus
-        base_score = W**2 / (h_inv_diag + 1e-9)
-        importance_scores = base_score * v_multiplier * uniqueness
-        del base_score , v_multiplier , uniqueness
-        # --- NEW OPTIMIZATION: Convert scores to a small Boolean mask ---
+        # 5. INTEGRATED SCORE (Geometric Blend)
+        # Combine SparseGPT sensitivity with our Piece-wise Vacuum and Uniqueness
+        # We use sqrt (0.5 power) to keep the balance stable.
+        importance_scores = (W**2 / (h_inv_diag + 1e-9)) * torch.sqrt(v_multiplier * uniqueness + 1e-12)
+        del v_multiplier, uniqueness
+        
+        # Create Boolean Mask
         thresh = torch.sort(importance_scores.flatten())[0][int(importance_scores.numel() * sparsity)]
         global_mask = importance_scores > thresh
-        del importance_scores # <--- GIANT SAVINGS: Deletes scores before the loop starts
+        del importance_scores
         
-        # 6. EXACT SparseGPT EXECUTION LOOP
-        W[:, torch.diag(H) == 0] = 0
-        del H    
+        # 6. SURGERY LOOP
+        W[:, dead_neurons] = 0
         Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
         del Hinv
+
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
             W1 = W[:, i1:i2].clone()
-            Q1 = torch.zeros_like(W1)
-            Err1 = torch.zeros_like(W1)
             Hinv1 = Hinv_cholesky[i1:i2, i1:i2]
-            
-            # Mask selection using the integrated champion scores
             mask1 = ~global_mask[:, i1:i2] 
 
             for i in range(count):
                 w = W1[:, i]; d = Hinv1[i, i]
                 q = w.clone()
                 q[mask1[:, i]] = 0 
-                Q1[:, i] = q
-
-                # Numerical correction to fix the error of killed weights
+                
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                Err1[:, i] = err1
+                W[:, i1+i] = q
 
-            W[:, i1:i2] = Q1
-            W[:, i2:] -= Err1.matmul(Hinv_cholesky[i1:i2, i2:])
+            W[:, i2:] -= (W[:, i1:i2] - W1) @ Hinv_cholesky[i1:i2, i2:]
             del W1, Hinv1, mask1
-        del Hinv_cholesky, global_mask
-        # 7. CONVERT BACK
-        if isinstance(self.layer, transformers.Conv1D):
-            W = W.t()
+            
+        del Hinv_cholesky, global_mask, dead_neurons
+        
+        # 7. CONVERT BACK & FLUSH
+        if isinstance(self.layer, transformers.Conv1D): W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        print(f"Champion Vacuum Pruning (n={n_vac}) Done.")
-    
+        
+        torch.cuda.empty_cache()
+        print(f"True Vacuum Pruning (n={n_vac}, Outlier-Protected) Done.")
     def free(self):
         if DEBUG:
             self.inp1 = None
