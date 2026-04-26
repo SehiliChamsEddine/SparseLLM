@@ -165,21 +165,21 @@ class SparseGPT_OPT:
             # print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
     def fasterprune_vacuum(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.05,
-        n_vac=3, lmbda=0, cooking_iters=0, lr_vac=0
+        n_vac=3, lmbda=0.001, cooking_iters=5, lr_vac=1e-4
     ):
         """
-        RAVS FINAL (Memory Optimized): The Record-Breaker.
-        Anchor Logic (0.5 Blend) + High Damping (0.05) + Anti-OOM Protections.
+        FIXED VACUUM PRUNING: Structural Discovery + Safe Execution.
+        Uses optimization to find the best mask, but resets to original values 
+        to preserve model intelligence.
         """
+        # 1. SETUP (Use Float32 for numerical stability)
         W = self.layer.weight.data.clone().float()
         W_orig = W.clone()
         H = self.H.float()
         dev = self.dev
-        
         tick = time.time()
-        print(f"  [1/4] Discovering Redundancy (Chunked Memory Safe)...")
 
-        # 1. CHUNKED UNIQUENESS (Anti-OOM)
+        # 2. CHUNKED REDUNDANCY (RAVS) - Memory Efficient
         d = torch.diag(H).abs()
         d_sqrt = torch.sqrt(d) + 1e-9
         redundancy = torch.zeros(self.columns, device=dev)
@@ -189,68 +189,74 @@ class SparseGPT_OPT:
             corr_chunk = torch.abs(h_chunk) / (d_sqrt[i:end].unsqueeze(1) * d_sqrt.unsqueeze(0))
             redundancy[i:end] = torch.sum(corr_chunk, dim=1)
             del h_chunk, corr_chunk
-        
-        uniqueness = (1.0 / torch.log1p(redundancy + 1.0))
+        uniqueness = 1.0 / torch.log1p(redundancy + 1.0)
         uniqueness = (uniqueness / uniqueness.max()).reshape((1, -1))
         uniqueness = torch.clamp(uniqueness, min=0.9)
-        del redundancy
 
-        # 2. ROW-WISE VACUUM (Anchor Strategy)
-        row_max = torch.max(torch.abs(W), dim=1, keepdim=True)[0] + 1e-9
-        v_multiplier = torch.pow(torch.abs(W) / row_max, n_vac)
+        # 3. STAGE 1: VACUUM COOKING (Search Phase)
+        # We optimize a COPY (Surrogate) to see which weights survive the Vacuum
+        W_surr = W.clone().requires_grad_(True)
+        optimizer = torch.optim.Adam([W_surr], lr=lr_vac)
+        H_norm = H / (torch.diag(H).max() + 1e-6)
 
-        # 3. RANKING & MASKING (Anti-OOM Sampling)
-        print(f"  [2/4] Ranking Weights and Building Mask...")
-        damp = percdamp * torch.mean(d)
-        diag = torch.arange(self.columns, device=dev)
-        H[diag, diag] += damp
-        Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
-        h_inv_diag = torch.diag(Hinv).reshape((1, -1))
-        
-        # Calculate scores using the Successful Anchor Blend (0.5 power)
-        importance_scores = (W**2 / (h_inv_diag + 1e-9)) * torch.sqrt(v_multiplier * uniqueness + 1e-12)
-        del v_multiplier, uniqueness
+        if cooking_iters > 0:
+            print(f"  - Cooking Vacuum for {cooking_iters} iterations...")
+            with torch.enable_grad():
+                for _ in range(cooking_iters):
+                    optimizer.zero_grad()
+                    # phi(w) = w^(2n+1). Use absolute to prevent complex numbers.
+                    phi_W = torch.sign(W_surr) * torch.pow(torch.abs(W_surr), 2 * n_vac + 1)
+                    # Minimize Output Error + Ridge Suction (lmbda)
+                    error = torch.trace((phi_W - W_orig) @ H_norm @ (phi_W - W_orig).t())
+                    loss = 0.5 * error + lmbda * torch.norm(W_surr)**2
+                    loss.backward()
+                    optimizer.step()
 
-        # Sampling Trick for huge layers to prevent sort-OOM
-        if importance_scores.numel() > 10_000_000:
-            sample = importance_scores.view(-1)[::10] # 10% sample
-            thresh = torch.quantile(sample, sparsity)
-        else:
-            thresh = torch.sort(importance_scores.flatten())[0][int(importance_scores.numel() * sparsity)]
-        
-        global_mask = importance_scores > thresh
-        del importance_scores, thresh
+        # 4. STAGE 2: IMPORTANCE RANKING
+        with torch.no_grad():
+            # Standard OBS sensitivity
+            Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H + percdamp * torch.eye(H.shape[0], device=dev)))
+            h_inv_diag = torch.diag(Hinv).reshape((1, -1))
+            
+            # We use the Survivor Weights from our cooking phase to pick the mask
+            row_max = torch.max(torch.abs(W_surr), dim=1, keepdim=True)[0] + 1e-9
+            v_multiplier = torch.pow(torch.abs(W_surr) / row_max, 2 * n_vac + 1)
+            
+            # Formula: (Sensitivity) * (Vacuum Success) * (Uniqueness)
+            # We take the square root to balance the influence
+            importance = (W_surr**2 / (h_inv_diag + 1e-9)) * torch.sqrt(v_multiplier * uniqueness + 1e-12)
+            
+            thresh = torch.sort(importance.flatten())[0][int(importance.numel() * sparsity)]
+            global_mask = importance > thresh
+            del W_surr, importance, v_multiplier
 
-        # 4. CORRECTION SURGERY (Industry Standard)
-        print(f"  [3/4] Performing Correction Surgery...")
+        # 5. STAGE 3: SAFE SURGERY (Execution Phase)
+        # CRITICAL: We reset W to the original healthy weights before pruning!
+        W = W_orig.clone()
+        W[:, torch.diag(H) == 0] = 0
         Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
 
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
             W1 = W[:, i1:i2].clone()
-            Hinv1 = Hinv[i1:i2, i1:i2]
-            mask1 = ~global_mask[:, i1:i2] 
+            Hinv1 = Hinv_cholesky[i1:i2, i1:i2]
+            mask1 = ~global_mask[:, i1:i2] # Weights to kill
 
             for i in range(count):
                 w = W1[:, i]; d = Hinv1[i, i]
                 q = w.clone()
                 q[mask1[:, i]] = 0 
-                
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 W[:, i1+i] = q
 
             W[:, i2:] -= (W[:, i1:i2] - W1) @ Hinv_cholesky[i1:i2, i2:]
-            torch.cuda.empty_cache()
 
-        # 5. CONVERT BACK
-        if isinstance(self.layer, transformers.Conv1D):
-            W = W.t()
+        # 6. CONVERT BACK
+        if isinstance(self.layer, transformers.Conv1D): W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        
-        print(f"  [4/4] Success: Layer Pruned in {time.time() - tick:.2f}s")
-        
+        print(f"  Success: Vacuum Structural Pruning Done in {time.time() - tick:.2f}s")
     def free(self):
         if DEBUG:
             self.inp1 = None
