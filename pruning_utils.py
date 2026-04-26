@@ -168,8 +168,8 @@ class SparseGPT_OPT:
         n_vac=1, lmbda=0.0001, cooking_iters=0, lr_vac=0
     ):
         """
-        NEW IDEA: Redundancy-Aware Vacuum Selection (RAVS).
-        Uses activation correlations to force the Vacuum to kill redundant neurons.
+        RAVS v2: Information-Guided Vacuum Pruning.
+        Refined denominator and log-uniqueness to beat the 127 baseline.
         """
         # 1. SETUP
         W = self.layer.weight.data.clone().float()
@@ -177,32 +177,33 @@ class SparseGPT_OPT:
         H = self.H.float()
         tick = time.time()
 
-        # 2. FEATURE REDUNDANCY MAP (The New Part)
-        # H is X^T @ X. The diagonals are the power, the off-diagonals are the correlation.
+        # 2. CALCULATE UNIQUENESS (Log-Scaled for stability)
+        # We want to know if an input is a 'duplicate'
         d = torch.diag(H)
-        # Calculate the Correlation Matrix: C_ij = H_ij / sqrt(H_ii * H_jj)
-        correlation_matrix = H / (torch.sqrt(outer_product(d, d)) + 1e-9)
-        # Uniqueness: 1 / Sum of absolute correlations (How 'independent' is this weight?)
-        uniqueness = 1.0 / (torch.sum(torch.abs(correlation_matrix), dim=1) + 1e-9)
-        uniqueness = uniqueness.reshape((1, -1)) # Shape for broadcasting
+        # Correlation matrix
+        C = H / (torch.sqrt(torch.outer(d, d)) + 1e-9)
+        # Sum of correlations (Redundancy count)
+        redundancy_count = torch.sum(torch.abs(C), dim=1)
+        # Uniqueness Prior: Use log to keep the range small (e.g., 1.0 to 0.8)
+        uniqueness_prior = 1.0 / torch.log1p(redundancy_count + 1e-9)
+        uniqueness_prior = (uniqueness_prior / uniqueness_prior.max()).reshape((1, -1))
 
-        # 3. VACUUM DISCOVERY
-        # Normalize weights for the vacuum scale (0 to 1)
+        # 3. VACUUM MODULATION
+        # Scale to 0-1 for the vacuum logic
         max_w = W.abs().max() + 1e-9
-        W_norm = W / max_w
-        # Apply Vacuum: phi(w) = w^3
-        W_vac = torch.pow(W_norm, 2 * n_vac + 1)
+        # phi(w) = w^3. We use this to 'dim' the importance of noise.
+        W_warped = torch.pow(W / max_w, 2 * n_vac + 1) * max_w
 
-        # 4. RAVS IMPORTANCE SCORE
-        # We combine: (Warped Value) * (Uniqueness) / (Hessian Uncertainty)
-        # This protects weights that are 'unique' and 'survive the vacuum'
+        # 4. THE MODULATED OBS METRIC
+        # We use the EXACT SparseGPT denominator [Hinv_ii]
         Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H + percdamp * torch.eye(H.shape[0], device=H.device)))
         h_inv_diag = torch.diag(Hinv).reshape((1, -1))
         
-        # This formula is unique: it penalizes redundancy and rewards vacuum survival
-        importance_scores = ( (W_vac * max_w)**2 * uniqueness ) / (h_inv_diag**2 + 1e-9)
+        # CORE FORMULA: Standard OBS * Vacuum_Survival * Uniqueness
+        # This is the most balanced version of your new ideas.
+        importance_scores = (W_warped**2 / (h_inv_diag + 1e-9)) * uniqueness_prior
 
-        # 5. SAFE EXECUTION (Standard SparseGPT Math for Stability)
+        # 5. EXECUTION (Safe SparseGPT loop)
         W[:, torch.diag(H) == 0] = 0
         Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
 
@@ -234,7 +235,7 @@ class SparseGPT_OPT:
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        print(f"RAVS Vacuum Pruning Done. Redundancy suppressed.")
+        print(f"IGVP (Information-Guided Vacuum) Done.")
     def free(self):
         if DEBUG:
             self.inp1 = None
