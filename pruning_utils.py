@@ -168,9 +168,9 @@ class SparseGPT_OPT:
         n_vac=1, lmbda=0, cooking_iters=0, lr_vac=0
     ):
         """
-        RAVS v3: Row-Aware Multiplier Strategy.
-        Uses row-wise normalization and clamped nudges to protect 
-        individual neuron logic.
+        THE 127-BASELINE VERSION: Subtle Tie-Breaking.
+        Uses a log-dampened multiplier to ensure the Vacuum improves the mask
+        without creating unrecoverable errors.
         """
         # 1. SETUP
         W = self.layer.weight.data.clone().float()
@@ -178,37 +178,39 @@ class SparseGPT_OPT:
         H = self.H.float()
         tick = time.time()
 
-        # 2. ROW-WISE VACUUM NUDGE (Smarter Scaling)
-        # We normalize each row independently so quiet neurons stay alive
-        row_max = torch.max(torch.abs(W), dim=1, keepdim=True)[0] + 1e-9
-        W_norm = torch.abs(W) / row_max
-        # Subtle Vacuum: (w_norm)^n. We use n=1 for the safest results.
-        v_multiplier = torch.pow(W_norm, n_vac)
-
-        # 3. INFORMATION UNIQUENESS (Clamped for safety)
+        # 2. INFORMATION UNIQUENESS (Log-Dampened)
         d = torch.diag(H)
         C = H / (torch.sqrt(torch.outer(d, d)) + 1e-9)
+        # redundancy = how many other features cover this signal
         redundancy = torch.sum(torch.abs(C), dim=1)
-        # Use a very soft nudge: 1 / log(redundancy)
-        u_multiplier = 1.0 / torch.log1p(redundancy + 1.1)
-        u_multiplier = (u_multiplier / u_multiplier.max()).reshape((1, -1))
-        # Clamp: Don't let uniqueness change the score by more than 30%
-        u_multiplier = torch.clamp(u_multiplier, min=0.7)
+        # Use log-scaling so the 'Unique' bonus is gentle (0.9 to 1.0 range)
+        u_nudge = 1.0 / torch.log1p(redundancy + 1.0)
+        u_nudge = (u_nudge / u_nudge.max()).reshape((1, -1))
+        u_nudge = torch.clamp(u_nudge, min=0.9) # Max 10% influence
 
-        # 4. PREPARE HESSIAN
+        # 3. ROW-WISE VACUUM (Normalized)
+        row_max = torch.max(torch.abs(W), dim=1, keepdim=True)[0] + 1e-9
+        # Normalize weights to 0-1 for the vacuum function phi(w) = w^n
+        v_nudge = torch.pow(torch.abs(W) / row_max, n_vac)
+        v_nudge = torch.clamp(v_nudge, min=0.9) # Max 10% influence
+
+        # 4. PREPARE HESSIAN (Float32 for precision)
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
         Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
         h_inv_diag = torch.diag(Hinv).reshape((1, -1))
 
-        # 5. INTEGRATED SCORE
-        # Standard OBS Foundation
+        # 5. INTEGRATED TIE-BREAKER SCORE
+        # Foundation: Standard OBS Score (Proven by SparseGPT)
         base_score = W**2 / (h_inv_diag + 1e-9)
-        # Apply the row-aware Vacuum and Uniqueness nudges
-        importance_scores = base_score * v_multiplier * u_multiplier
+        
+        # Blended Score: Foundation * (Vacuum * Uniqueness)^0.1
+        # The 0.1 exponent is the 'Secret Sauce' - it makes our new ideas
+        # act as a Tie-Breaker for weights that are close in value.
+        importance_scores = base_score * torch.pow(v_nudge * u_nudge, 0.1)
 
-        # 6. ONE-SHOT EXECUTION (The SparseGPT standard)
+        # 6. EXACT SparseGPT EXECUTION
         W[:, torch.diag(H) == 0] = 0
         Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
 
@@ -220,6 +222,7 @@ class SparseGPT_OPT:
             Err1 = torch.zeros_like(W1)
             Hinv1 = Hinv_cholesky[i1:i2, i1:i2]
             
+            # Select Mask using the Blended Score
             imp_block = importance_scores[:, i1:i2]
             thresh = torch.sort(imp_block.flatten())[0][int(imp_block.numel() * sparsity)]
             mask1 = imp_block <= thresh
@@ -227,8 +230,10 @@ class SparseGPT_OPT:
             for i in range(count):
                 w = W1[:, i]; d = Hinv1[i, i]
                 q = w.clone()
-                q[mask1[:, i]] = 0 
+                q[mask1[:, i]] = 0 # Apply Pruning
                 Q1[:, i] = q
+
+                # Industry-standard error carry
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 Err1[:, i] = err1
@@ -240,7 +245,7 @@ class SparseGPT_OPT:
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        print(f"Row-Aware Vacuum Pruning Done.")
+        print(f"Subtle Vacuum Pruning Done.")
         
     def free(self):
         if DEBUG:
