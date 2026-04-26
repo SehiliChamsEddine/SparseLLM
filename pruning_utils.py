@@ -206,7 +206,12 @@ class SparseGPT_OPT:
         # 1.4 THE BALANCED SCORE (THE CHANGE IS HERE)
         # We blend the Vacuum and Uniqueness with a square root (power of 0.5)
         # This makes the Vacuum an 'Advisor' instead of a 'Boss'.
-        balanced_advisor = torch.sqrt(v_multiplier * uniqueness + 1e-12)
+       # --- THE FINAL TUNING: The Goldilocks Blend ---
+        # 0.35 is the 'Magic Number' for balancing non-linear vacuuming 
+        # with linear Hessian safety.
+        balanced_advisor = torch.pow(v_multiplier * uniqueness + 1e-12, 0.35)
+        
+        # Combined Score
         importance_scores = (W**2 / (h_inv_diag + 1e-9)) * balanced_advisor
         
         del v_multiplier, uniqueness, balanced_advisor
