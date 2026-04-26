@@ -168,45 +168,47 @@ class SparseGPT_OPT:
         n_vac=1, lmbda=0, cooking_iters=0, lr_vac=0
     ):
         """
-        STABILIZED RAVS: The Multiplier Strategy.
-        Uses the Vacuum and Uniqueness to 'nudge' the SparseGPT rank.
-        This prevents the '301 PPL' breaking by keeping the Hessian in control.
+        RAVS v3: Row-Aware Multiplier Strategy.
+        Uses row-wise normalization and clamped nudges to protect 
+        individual neuron logic.
         """
-        # 1. SETUP (Float32 for precision)
+        # 1. SETUP
         W = self.layer.weight.data.clone().float()
         W_orig = W.clone()
         H = self.H.float()
         tick = time.time()
 
-        # 2. CALCULATE THE "NUDGES" (The Intelligence)
-        # Uniqueness Nudge: How independent is this feature?
+        # 2. ROW-WISE VACUUM NUDGE (Smarter Scaling)
+        # We normalize each row independently so quiet neurons stay alive
+        row_max = torch.max(torch.abs(W), dim=1, keepdim=True)[0] + 1e-9
+        W_norm = torch.abs(W) / row_max
+        # Subtle Vacuum: (w_norm)^n. We use n=1 for the safest results.
+        v_multiplier = torch.pow(W_norm, n_vac)
+
+        # 3. INFORMATION UNIQUENESS (Clamped for safety)
         d = torch.diag(H)
         C = H / (torch.sqrt(torch.outer(d, d)) + 1e-9)
         redundancy = torch.sum(torch.abs(C), dim=1)
-        # We use a soft-multiplier (0.5 to 1.0) so we don't destroy the score
-        u_multiplier = 1.0 / torch.sqrt(redundancy + 1e-9)
+        # Use a very soft nudge: 1 / log(redundancy)
+        u_multiplier = 1.0 / torch.log1p(redundancy + 1.1)
         u_multiplier = (u_multiplier / u_multiplier.max()).reshape((1, -1))
+        # Clamp: Don't let uniqueness change the score by more than 30%
+        u_multiplier = torch.clamp(u_multiplier, min=0.7)
 
-        # Vacuum Nudge: How well does it survive the warping?
-        max_w = W.abs().max() + 1e-9
-        # We use a soft-vacuum nudge: (normalized weight)^n
-        v_multiplier = torch.pow(W.abs() / max_w, n_vac)
-
-        # 3. PREPARE STABLE HESSIAN INVERSE
+        # 4. PREPARE HESSIAN
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
         Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
         h_inv_diag = torch.diag(Hinv).reshape((1, -1))
 
-        # 4. THE INTEGRATED SCORE (Foundation + Nudges)
-        # Foundation: Standard SparseGPT OBS Score (w^2 / Hinv)
-        # Nudges: Vacuum survival and Information Uniqueness
-        # This keeps the Hessian (Safety) as the main driver.
+        # 5. INTEGRATED SCORE
+        # Standard OBS Foundation
         base_score = W**2 / (h_inv_diag + 1e-9)
+        # Apply the row-aware Vacuum and Uniqueness nudges
         importance_scores = base_score * v_multiplier * u_multiplier
 
-        # 5. SAFE SparseGPT EXECUTION (The Correct Error-Carry)
+        # 6. ONE-SHOT EXECUTION (The SparseGPT standard)
         W[:, torch.diag(H) == 0] = 0
         Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
 
@@ -218,7 +220,6 @@ class SparseGPT_OPT:
             Err1 = torch.zeros_like(W1)
             Hinv1 = Hinv_cholesky[i1:i2, i1:i2]
             
-            # Select Mask using our Integrated Intelligence
             imp_block = importance_scores[:, i1:i2]
             thresh = torch.sort(imp_block.flatten())[0][int(imp_block.numel() * sparsity)]
             mask1 = imp_block <= thresh
@@ -228,21 +229,19 @@ class SparseGPT_OPT:
                 q = w.clone()
                 q[mask1[:, i]] = 0 
                 Q1[:, i] = q
-
-                # This correction math is the 'Gold Standard' from the SparseGPT paper
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 Err1[:, i] = err1
 
             W[:, i1:i2] = Q1
-            # Push error to remaining weights to preserve Perplexity
             W[:, i2:] -= Err1.matmul(Hinv_cholesky[i1:i2, i2:])
 
-        # 6. CONVERT TO MODEL DTYPE
+        # 7. CONVERT BACK
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        print(f"Stabilized RAVS (n={n_vac}) Done.")
+        print(f"Row-Aware Vacuum Pruning Done.")
+        
     def free(self):
         if DEBUG:
             self.inp1 = None
