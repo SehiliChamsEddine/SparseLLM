@@ -252,35 +252,38 @@ class SparseGPT_OPT:
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
         n_vac=3, lmbda=0, cooking_iters=0, lr_vac=0
     ):
-        # 1. SETUP & MEMORY INITIALIZATION
+        # 1. SETUP
         W = self.layer.weight.data.clone().float()
         H = self.H.float()
         dead_neurons = torch.diag(H) == 0
         dev = self.dev
         tick = time.time()
 
-        # 2. FEATURE UNIQUENESS (Chunked for Memory)
-        d = torch.diag(H)
-        C = H / (torch.sqrt(torch.outer(d, d)) + 1e-9)
-        uniqueness = 1.0 / torch.log1p(torch.sum(torch.abs(C), dim=1) + 1.0)
-        del C
+        # 2. CHUNKED REDUNDANCY (Memory Efficient)
+        d = torch.diag(H).abs()
+        d_sqrt = torch.sqrt(d) + 1e-9
+        redundancy = torch.zeros(self.columns, device=dev)
+        for i in range(0, self.columns, 512):
+            end = min(i + 512, self.columns)
+            h_chunk = H[i:end, :]
+            corr_chunk = torch.abs(h_chunk) / (d_sqrt[i:end].unsqueeze(1) * d_sqrt.unsqueeze(0))
+            redundancy[i:end] = torch.sum(corr_chunk, dim=1)
+            del h_chunk, corr_chunk
+        uniqueness = 1.0 / torch.log1p(redundancy + 1.0)
         uniqueness = (uniqueness / uniqueness.max()).reshape((1, -1))
         uniqueness = torch.clamp(uniqueness, min=0.9)
 
-        # 3. PIECE-WISE VACUUM (The property: phi(x)=x for x >= 1)
-        # We define 'Signal' as the top 10% of weights in each row.
-        # Everything below the 90th percentile is 'Noise' subject to the vacuum.
-        row_threshold = torch.quantile(torch.abs(W), 0.9, dim=1, keepdim=True)
-        # Normalize weights so that the threshold is 1.0
-        W_norm = torch.abs(W) / (row_threshold + 1e-9)
+        # 3. BALANCED PIECE-WISE VACUUM (The Goldilocks Boundary)
+        # We move the boundary to the Median (0.5). 
+        # This protects the top 50% of weights (Signal) and vacuums the rest (Noise).
+        row_median = torch.quantile(torch.abs(W), 0.5, dim=1, keepdim=True)
+        W_norm = torch.abs(W) / (row_median + 1e-9)
         
-        # Apply the Property:
-        # If w_norm >= 1.0: v_multiplier = w_norm (Linear Zone)
-        # If w_norm < 1.0: v_multiplier = w_norm^n (Vacuum Zone)
+        # phi(x)=x for x>=1, phi(x)=x^n for x<1
         v_multiplier = torch.where(W_norm >= 1.0, W_norm, torch.pow(W_norm, n_vac))
-        del W_norm, row_threshold
+        del W_norm, row_median
 
-        # 4. PREPARE HESSIAN
+        # 4. HESSIAN PREPARATION
         damp = percdamp * torch.mean(d)
         diag = torch.arange(self.columns, device=dev)
         H[diag, diag] += damp
@@ -288,9 +291,9 @@ class SparseGPT_OPT:
         h_inv_diag = torch.diag(Hinv).reshape((1, -1))
         del H
             
-        # 5. INTEGRATED SCORE (Geometric Blend)
-        # Combine SparseGPT sensitivity with our Piece-wise Vacuum and Uniqueness
-        # We use sqrt (0.5 power) to keep the balance stable.
+        # 5. GEOMETRIC BLEND SCORE
+        # We use the 0.5 power (sqrt) to ensure the Vacuum acts as an ADVISOR.
+        # This balance is what achieved your 128.2 result.
         importance_scores = (W**2 / (h_inv_diag + 1e-9)) * torch.sqrt(v_multiplier * uniqueness + 1e-12)
         del v_multiplier, uniqueness
         
@@ -299,7 +302,7 @@ class SparseGPT_OPT:
         global_mask = importance_scores > thresh
         del importance_scores
         
-        # 6. SURGERY LOOP
+        # 6. EXACT SparseGPT SURGERY
         W[:, dead_neurons] = 0
         Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
         del Hinv
@@ -315,7 +318,6 @@ class SparseGPT_OPT:
                 w = W1[:, i]; d = Hinv1[i, i]
                 q = w.clone()
                 q[mask1[:, i]] = 0 
-                
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 W[:, i1+i] = q
@@ -325,12 +327,10 @@ class SparseGPT_OPT:
             
         del Hinv_cholesky, global_mask, dead_neurons
         
-        # 7. CONVERT BACK & FLUSH
         if isinstance(self.layer, transformers.Conv1D): W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        
         torch.cuda.empty_cache()
-        print(f"True Vacuum Pruning (n={n_vac}, Outlier-Protected) Done.")
+        print(f"Balanced Vacuum Pruning (n={n_vac}, 50% Protected) Done.")
     def free(self):
         if DEBUG:
             self.inp1 = None
