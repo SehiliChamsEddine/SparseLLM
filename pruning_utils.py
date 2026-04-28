@@ -417,7 +417,7 @@ class SparseGPT_OPT:
     #     self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
     #     torch.cuda.empty_cache()
     #     print(f"Balanced Vacuum Pruning (n={n_vac}, 50% Protected) Done.")
-    def hcv_svd_fastpruner(
+    def hcv_fastpruner(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
         n_vac=2
     ):
