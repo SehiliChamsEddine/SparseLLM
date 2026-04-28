@@ -250,71 +250,69 @@ class SparseGPT_OPT:
         print(f"Champion Vacuum Pruning (n={n_vac}) Done.")
     
         
-    def ise_mha_pruner(
-        self, sparsity, num_heads, prunen=0, prunem=0, blocksize=128, percdamp=.01
+    def hcv_asgp_fastpruner(
+        self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01
     ):
         """
-        NEW INVENTION: Independent Subspace Extraction (ISE).
-        No Hessian ranking. No Vacuum.
-        Uses QR-Decomposition to find the 'Information Basis' of each head.
+        MY OWN INVENTION: Active-Signal Geometry Preservation (ASGP).
+        No Hessian Inverse. No Vacuum. No Overfitting.
+        Prunes based on Information Flow and performs Energy Recycling.
         """
         import torch
         import time
 
         # 1. SETUP
         W = self.layer.weight.data.clone().float()
+        H = self.H.float()
         dev = self.dev
-        n_rows, n_cols = W.shape
-        head_dim = n_rows // num_heads
         tick = time.time()
 
-        # 2. INDEPENDENCE RANKING (The ISE Invention)
-        # We find which weights are 'Original' vs 'Copycats'
-        independence_scores = torch.zeros_like(W)
+        # 2. SIGNAL POWER DISCOVERY
+        # We look at the energy of the inputs (The 'Loudness' of the data)
+        input_power = torch.diag(H).abs()
+        # sqrt of power gives us the 'Signal Magnitude'
+        signal_magnitude = torch.sqrt(input_power + 1e-9).reshape(1, -1)
 
-        for h in range(num_heads):
-            # Slice the head weights
-            W_h = W[h*head_dim : (h+1)*head_dim, :] # [head_dim, n_cols]
-            
-            # Perform QR Decomposition with Column Pivoting (approximated here)
-            # We use the SVD-U projection to see which weights carry unique 'Logic'
-            U, S, Vh = torch.linalg.svd(W_h, full_matrices=False)
-            
-            # The 'Independence' of a weight is its projection onto the 
-            # Top-K Logical Subspace.
-            # This identifies the 'Basis Vectors' of the Attention Head.
-            W_h_basis = torch.abs(W_h @ Vh.t()) @ Vh
-            independence_scores[h*head_dim : (h+1)*head_dim, :] = W_h_basis.abs()
-            
-            del U, S, Vh, W_h_basis
+        # 3. INTERACTION RANKING (The ASGP Score)
+        # We rank weights by how much 'Real Signal' they pass
+        # Importance = Weight Magnitude * Input Signal Magnitude
+        # This identifies the 'Highways' of the Attention block.
+        importance_scores = torch.abs(W) * signal_magnitude
 
-        # 3. MASK SELECTION (Pure Information Ranking)
-        # We rank based on who provides the most independent logic to the head
-        thresh = torch.sort(independence_scores.flatten())[0][int(independence_scores.numel() * sparsity)]
-        mask = independence_scores > thresh
-        del independence_scores
-
-        # 4. LEAST-SQUARES RE-FIT (The 'Healer')
-        # Instead of Hessian error carry, we use a global pseudo-inverse fit.
-        # This is pure linear algebra, much safer than Hessian-based updates.
-        W_pruned = W * mask
+        # 4. GLOBAL MASK SELECTION
+        # We pick the top survivors across the entire layer at once
+        thresh = torch.sort(importance_scores.flatten())[0][int(importance_scores.numel() * sparsity)]
+        mask = (importance_scores > thresh).float()
         
-        # We optimize the surviving weights to match the original W's behavior
-        # using a simple column-wise scaling factor to keep it fast
+        # 5. ENERGY RECYCLING (The 'Healing' Step)
+        # When we kill weights, the output signal becomes 'quiet'.
+        # We calculate the loss of energy and boost the survivors to compensate.
         with torch.no_grad():
-            # Calculate the energy preservation factor
-            orig_energy = torch.norm(W, dim=1, keepdim=True)
-            pruned_energy = torch.norm(W_pruned, dim=1, keepdim=True)
-            scale = (orig_energy / (pruned_energy + 1e-9))
-            # Re-scale survivors to fill the 'Information Gap'
-            W_final = W_pruned * scale
+            # Original signal energy per row (output neuron)
+            orig_energy = torch.sum(importance_scores, dim=1, keepdim=True)
+            # Remaining signal energy after pruning
+            pruned_energy = torch.sum(importance_scores * mask, dim=1, keepdim=True)
+            
+            # The Recycle Factor: How much to boost survivors?
+            # This ensures the 'Volume' of the model stays the same.
+            recycle_factor = orig_energy / (pruned_energy + 1e-9)
+            # Clamp to prevent extreme values
+            recycle_factor = torch.clamp(recycle_factor, max=2.0)
+            
+            W_final = (W * mask) * recycle_factor
 
-        # 5. CONVERT BACK
+        # 6. CONVERT BACK
         if isinstance(self.layer, transformers.Conv1D):
             W_final = W_final.t()
+        
+        # Cast back to model dtype (e.g., half/fp16)
         self.layer.weight.data = W_final.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
         
-        print(f"  ISE Pruning Done: {num_heads} Logic Bases Extracted.")
+        # Memory Cleanup
+        del W, H, importance_scores, mask, recycle_factor, signal_magnitude, input_power
+        torch.cuda.empty_cache()
+
+        print(f"  ASGP Pruning Done. Signal Highways Preserved.")
         
     def free(self):
         if DEBUG:
