@@ -417,6 +417,94 @@ class SparseGPT_OPT:
     #     self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
     #     torch.cuda.empty_cache()
     #     print(f"Balanced Vacuum Pruning (n={n_vac}, 50% Protected) Done.")
+    def hcv_fastpruner(
+        self, sparsity, num_heads, prunen=0, prunem=0, blocksize=128, percdamp=.01,
+        n_vac=3
+    ):
+        """
+        NEW METHOD: Head-Coherence Vacuum (HCV) Pruner.
+        Dynamically adjusts vacuum strength based on the information-density 
+        of each Attention Head.
+        """
+        # 1. SETUP
+        W = self.layer.weight.data.clone().float()
+        H = self.H.float()
+        dev = self.dev
+        n_rows, n_cols = W.shape
+        head_dim = n_rows // num_heads
+        tick = time.time()
+
+        # 2. CALCULATE HEAD COHERENCE (The Intelligence)
+        # Measure which heads are carrying the most important signal
+        head_power = torch.zeros(num_heads, device=dev)
+        for h in range(num_heads):
+            # Head slice
+            W_h = W[h*head_dim : (h+1)*head_dim, :]
+            # Power = Trace(W H W^T) -> Simplified as sum( (W@H) * W )
+            # This measures the information density of the head
+            head_power[h] = torch.sum((W_h @ H) * W_h)
+        
+        # Normalize Coherence Multiplier (Low power = High Vacuum)
+        # Exp helps create a sharp distinction between focused and diffuse heads
+        coherence_mult = torch.exp(-0.5 * (head_power / (head_power.mean() + 1e-9)))
+        # Reshape for broadcasting: [num_heads, 1, 1] -> [n_rows, n_cols]
+        head_n_vac = (n_vac * coherence_mult).view(num_heads, 1).expand(-1, head_dim).reshape(-1, 1)
+
+        # 3. CHUNKED UNIQUENESS (RAVS logic for MHA)
+        d_sqrt = torch.sqrt(torch.diag(H).abs()) + 1e-9
+        redundancy = torch.zeros(self.columns, device=dev)
+        for i in range(0, self.columns, 512):
+            end = min(i + 512, self.columns)
+            h_chunk = H[i:end, :]
+            corr_chunk = torch.abs(h_chunk) / (d_sqrt[i:end].unsqueeze(1) * d_sqrt.unsqueeze(0))
+            redundancy[i:end] = torch.sum(corr_chunk, dim=1)
+            del h_chunk, corr_chunk
+        uniqueness = (1.0 / torch.log1p(redundancy + 1.0)).reshape((1, -1))
+        uniqueness = torch.clamp(uniqueness / uniqueness.max(), min=0.9)
+
+        # 4. THE DYNAMIC HEAD VACUUM
+        row_max = torch.max(torch.abs(W), dim=1, keepdim=True)[0] + 1e-9
+        # Each row (neuron) now has a unique vacuum power based on its Head's Coherence
+        v_multiplier = torch.pow(torch.abs(W) / row_max, head_n_vac)
+
+        # 5. PREPARE HESSIAN & SCORE
+        damp = percdamp * torch.mean(torch.diag(H).abs())
+        diag = torch.arange(self.columns, device=dev)
+        H[diag, diag] += damp
+        Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
+        h_inv_diag = torch.diag(Hinv).reshape((1, -1))
+        
+        # Combined Score with 0.5 Geometric Blend
+        importance = (W**2 / (h_inv_diag + 1e-9)) * torch.sqrt(v_multiplier * uniqueness + 1e-12)
+        
+        # Global Mask creation
+        thresh = torch.sort(importance.flatten())[0][int(importance.numel() * sparsity)]
+        global_mask = importance > thresh
+        del importance, v_multiplier, uniqueness, head_n_vac
+
+        # 6. SURGERY LOOP
+        Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
+        for i1 in range(0, self.columns, blocksize):
+            i2 = min(i1 + blocksize, self.columns)
+            count = i2 - i1
+            W1 = W[:, i1:i2].clone(); Hinv1 = Hinv[i1:i2, i1:i2]
+            mask1 = ~global_mask[:, i1:i2] 
+
+            for i in range(count):
+                w = W1[:, i]; d = Hinv1[i, i]
+                q = w.clone(); q[mask1[:, i]] = 0 
+                err1 = (w - q) / d
+                W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+                W[:, i1+i] = q
+
+            W[:, i2:] -= (W[:, i1:i2] - W1) @ Hinv_cholesky[i1:i2, i2:]
+            torch.cuda.empty_cache()
+
+        # 7. CLEANUP
+        if isinstance(self.layer, transformers.Conv1D): W = W.t()
+        self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
+        print(f"  HCV Pruning Complete: {num_heads} Heads Optimized.")
+        
     def free(self):
         if DEBUG:
             self.inp1 = None
