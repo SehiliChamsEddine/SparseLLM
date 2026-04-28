@@ -117,7 +117,14 @@ def opt_sparsellm(model, dataloader, dev, args):
                 print('Pruning ...')
                 # Prune the layer
                 sparsity = args.sparsity
-                # if args.use_vacuum :
+                if args.use_vacuum :
+                    # Logic Layers: Use Head-Coherence Vacuuming
+                    num_heads = model.config.num_attention_heads
+                    gpts[name].hcv_fastpruner(
+                        args.sparsity, 
+                        num_heads=num_heads,
+                        n_vac=args.n_vac
+                                        )
                 #     print('Pruning with VACUUM ...')
                 #     gpts[name].fasterprune_vacuum(
                 #     args.sparsity,
@@ -130,11 +137,11 @@ def opt_sparsellm(model, dataloader, dev, args):
                 #     cooking_iters=args.cooking_iters,
                 #     lr_vac=args.lr_vac      # Passes as 'lr_vac'
                                         # )
-                # else:
-                print('Pruning with SparseGPT ...')
-                gpts[name].fasterprune(
-                    sparsity, prunen=args.prunen, prunem=args.prunem, percdamp=args.percdamp, blocksize=args.blocksize
-                )
+                else:
+                    print('Pruning with SparseGPT ...')
+                    gpts[name].fasterprune(
+                        sparsity, prunen=args.prunen, prunem=args.prunem, percdamp=args.percdamp, blocksize=args.blocksize
+                    )
                    
                 
                 gpts[name].free()
