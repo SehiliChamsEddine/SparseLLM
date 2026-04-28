@@ -121,7 +121,7 @@ def opt_sparsellm(model, dataloader, dev, args):
                  
                               
                     # Use the new Active-Signal Manifold invention
-                    gpts[name].hcv_joint_fastpruner(args.sparsity, n_vac=2)
+                    gpts[name].hcv_joint_fastpruner(args.sparsity, n_vac=args.n_vac)
                 #     gpts[name].fasterprune_vacuum(
                 #     args.sparsity,
                 #     prunen=args.prunen,
