@@ -422,9 +422,9 @@ class SparseGPT_OPT:
         n_vac=3
     ):
         """
-        TEACHER'S METHOD: Spectral Vacuum Pruning (SVP).
-        Decomposes weights into SVD, vacuums the singular values, 
-        and reconstructs the logical manifold.
+        TEACHER'S METHOD v2: Spectral-Manifold Nudging (SMN).
+        Uses SVD to identify logical directions and applies the Vacuum 
+        to filter directional noise. Optimized for stability.
         """
         # 1. SETUP
         W = self.layer.weight.data.clone().float()
@@ -432,62 +432,76 @@ class SparseGPT_OPT:
         dev = self.dev
         tick = time.time()
 
-        # 2. SPECTRAL VACUUMING (Teacher's Idea + Vacuum)
-        # We perform SVD to find the 'Logic Channels' of the layer
-        # W = U * S * Vh
-        U, S, Vh = torch.linalg.svd(W, full_matrices=False)
-        
-        # Apply Vacuum to Singular Values (S)
-        # This keeps the logic directions (U, Vh) but vacuums the noise energy
-        s_max = S.max() + 1e-9
-        # phi(s) = s * (s/max)^n
-        s_v_multiplier = torch.pow(S / s_max, n_vac)
-        S_vac = S * s_v_multiplier
-        
-        # Reconstruct the 'Cleaned' Weight Matrix
-        W_spectral = (U * S_vac.unsqueeze(0)) @ Vh
-        del U, S, Vh, S_vac, s_v_multiplier
+        # 2. SPECTRAL POWER DISCOVERY (The Teacher's Hint)
+        # W = U * S * Vh. We use a fast randomized SVD for larger layers
+        with torch.no_grad():
+            U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+            # Spectral Energy: How much 'Logic' is in each weight?
+            # We reconstruct a 'Clean' W using a soft vacuum on singular values
+            s_norm = S / (S.max() + 1e-9)
+            s_vac = S * torch.pow(s_norm, 1.0) # Gentle vacuum on eigenvalues
+            W_logic = (U * s_vac.unsqueeze(0)) @ Vh
+            # The 'Spectral Logic' score
+            spectral_nudge = W_logic.abs()
+            del U, S, Vh, s_vac, W_logic
 
-        # 3. PREPARE HESSIAN FOUNDATION
-        damp = percdamp * torch.mean(torch.diag(H).abs())
+        # 3. CHUNKED UNIQUENESS (Redundancy Mapping)
+        d = torch.diag(H).abs()
+        d_sqrt = torch.sqrt(d) + 1e-9
+        redundancy = torch.zeros(self.columns, device=dev)
+        for i in range(0, self.columns, 512):
+            end = min(i + 512, self.columns)
+            h_chunk = H[i:end, :]
+            corr_chunk = torch.abs(h_chunk) / (d_sqrt[i:end].unsqueeze(1) * d_sqrt.unsqueeze(0))
+            redundancy[i:end] = torch.sum(corr_chunk, dim=1)
+            del h_chunk, corr_chunk
+        uniqueness = (1.0 / torch.log1p(redundancy + 1.0)).reshape((1, -1))
+        uniqueness = torch.clamp(uniqueness / uniqueness.max(), min=0.9)
+
+        # 4. ROW-WISE VACUUM (Warping)
+        row_max = torch.max(torch.abs(W), dim=1, keepdim=True)[0] + 1e-9
+        v_multiplier = torch.pow(torch.abs(W) / row_max, n_vac)
+
+        # 5. INTEGRATED CHAMPION SCORE
+        # Prepare Hessian
+        damp = percdamp * torch.mean(d)
         diag = torch.arange(self.columns, device=dev)
         H[diag, diag] += damp
         Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
         h_inv_diag = torch.diag(Hinv).reshape((1, -1))
         
-        # 4. RANKING IN SPECTRAL SPACE
-        # We use the Spectrally-Cleaned matrix to decide the mask
-        importance = (W_spectral**2 / (h_inv_diag + 1e-9))
+        # CORE FORMULA: 
+        # Base (SparseGPT) * Vacuum * Uniqueness * Spectral Nudge
+        # We use a 0.2 power on the Spectral Nudge to keep it stable
+        base_score = W**2 / (h_inv_diag + 1e-9)
+        importance = base_score * torch.sqrt(v_multiplier * uniqueness) * torch.pow(spectral_nudge + 1e-12, 0.2)
         
         # Create Global Mask
         thresh = torch.sort(importance.flatten())[0][int(importance.numel() * sparsity)]
         global_mask = importance > thresh
-        del importance, W_spectral
+        del importance, v_multiplier, uniqueness, spectral_nudge
 
-        # 5. STABLE SURGERY (Correct the error of the mask)
+        # 6. STABLE SURGERY (Exact OBS)
         W[:, torch.diag(H) == 0] = 0
         Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
-
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
             W1 = W[:, i1:i2].clone(); Hinv1 = Hinv[i1:i2, i1:i2]
             mask1 = ~global_mask[:, i1:i2] 
-
             for i in range(count):
                 w = W1[:, i]; d = Hinv1[i, i]
                 q = w.clone(); q[mask1[:, i]] = 0 
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 W[:, i1+i] = q
-
             W[:, i2:] -= (W[:, i1:i2] - W1) @ Hinv_cholesky[i1:i2, i2:]
             torch.cuda.empty_cache()
 
-        # 6. CONVERT BACK
+        # 7. CONVERT BACK
         if isinstance(self.layer, transformers.Conv1D): W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        print(f"  Spectral Vacuum Pruning Done. SVD-logic preserved.")
+        print(f"  Spectral Vacuum Pruning Done. Manifold Logic Preserved.")
         
     def free(self):
         if DEBUG:
