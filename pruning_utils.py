@@ -250,14 +250,14 @@ class SparseGPT_OPT:
         print(f"Champion Vacuum Pruning (n={n_vac}) Done.")
     
         
-    def hcv_joint_fastpruner(
+    def topological_vacuum_pruner(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
-        n_vac=2
+        n_vac=3
     ):
         """
-        NEW INVENTION: Active-Signal Manifold Pruning (ASMP).
-        Combines Teacher's SVD logic with Data-Aware Hessian weighting.
-        Target: Beating the 117 PPL baseline.
+        MY OWN INVENTION: Topological Anchor Pruning (TAP).
+        Identifies 'Anchor' neurons (pure signal) and 'Bridge' neurons (crosstalk).
+        Vacuums the bridges, protects the anchors.
         """
         # 1. SETUP
         W = self.layer.weight.data.clone().float()
@@ -265,77 +265,66 @@ class SparseGPT_OPT:
         dev = self.dev
         tick = time.time()
 
-        # 2. ACTIVE SIGNAL DISCOVERY (The Teacher + Data Hybrid)
-        # We look at the weight's importance weighted by the Input Power (diag of H)
-        d_diag = torch.diag(H).abs()
-        # Scale weights by the signal they actually carry
-        # W_active represents the 'Real Information Flow'
-        W_active = W * torch.sqrt(d_diag + 1e-9).reshape(1, -1)
+        # 2. TOPOLOGICAL ANCHOR DISCOVERY (The Invention)
+        # Signal = Diagonal of H (The power of the feature)
+        signal = torch.diag(H).abs()
+        # Crosstalk = Sum of off-diagonals (How much it overlaps with others)
+        # We do this in a memory-efficient way
+        crosstalk = torch.sum(torch.abs(H), dim=1) - signal
         
-        # SVD on the Active Signal to find the Principal Reasoning Manifold
-        with torch.no_grad():
-            # We use the top 25% of singular values to define the 'Signal'
-            U, S, Vh = torch.linalg.svd(W_active, full_matrices=False)
-            s_mask = torch.zeros_like(S)
-            k = max(1, len(S) // 4) 
-            s_mask[:k] = 1.0 # Keep only the top logical channels
-            
-            # Reconstruct the 'Logic Skeleton'
-            W_manifold = (U * (S * s_mask).unsqueeze(0)) @ Vh
-            # The 'Manifold Survival Score'
-            # Weights that align with the Active Manifold get a huge bonus
-            manifold_nudge = W_manifold.abs()
-            del U, S, Vh, W_manifold, s_mask, W_active
+        # Anchor Score (Purity): Range 0 to 1
+        # High score = Unique signal. Low score = Redundant crosstalk.
+        anchor_score = signal / (signal + crosstalk + 1e-9)
+        # Reshape for broadcasting
+        anchor_score = anchor_score.reshape((1, -1))
+        
+        # 3. DYNAMIC TOPOLOGICAL VACUUM
+        # We make the vacuum power dependent on the anchor score
+        # Anchors (score 1) get power 0. Bridges (score 0) get power n_vac.
+        dynamic_n = n_vac * (1.0 - anchor_score)
+        
+        row_max = torch.max(torch.abs(W), dim=1, keepdim=True)[0] + 1e-9
+        # The 'Suction' is now topologically aware
+        v_multiplier = torch.pow(torch.abs(W) / row_max, dynamic_n)
 
-        # 3. HESSIAN PREPARATION
-        damp = percdamp * torch.mean(d_diag)
+        # 4. HESSIAN FOUNDATION
+        damp = percdamp * torch.mean(signal)
         diag = torch.arange(self.columns, device=dev)
-        H_tmp = H.clone()
-        H_tmp[diag, diag] += damp
-        Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H_tmp))
+        H[diag, diag] += damp
+        Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
         h_inv_diag = torch.diag(Hinv).reshape((1, -1))
-        del H_tmp
 
-        # 4. THE ASMP CHAMPION SCORE
-        # base = Standard SparseGPT (The 117 PPL foundation)
-        base_score = W**2 / (h_inv_diag + 1e-9)
+        # 5. INTEGRATED RANKING
+        # Combine SparseGPT stability with Topological Vacuuming
+        importance = (W**2 / (h_inv_diag + 1e-9)) * torch.sqrt(v_multiplier + 1e-12)
         
-        # We use the Vacuum to 'clean' the manifold nudge
-        # This creates a sharp gap between 'Logic' and 'Noise'
-        max_m = manifold_nudge.max() + 1e-12
-        v_nudge = torch.pow(manifold_nudge / max_m, n_vac)
-        
-        # FINAL FORMULA: Base * (Active Manifold)^0.2
-        # A 0.2 power ensures the manifold logic guides the decision 
-        # but the Hessian safety math stays in control.
-        importance = base_score * torch.pow(v_nudge + 1e-12, 0.2)
-        
-        # Create Global Mask
+        # Create Mask
         thresh = torch.sort(importance.flatten())[0][int(importance.numel() * sparsity)]
         global_mask = importance > thresh
-        del importance, v_nudge, manifold_nudge
+        del importance, v_multiplier, anchor_score, dynamic_n
 
-        # 5. EXACT SURGERY (The correction)
-        W_orig = W.clone()
+        # 6. SURGERY (Exact OBS Correction)
         Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
             W1 = W[:, i1:i2].clone(); Hinv1 = Hinv[i1:i2, i1:i2]
             mask1 = ~global_mask[:, i1:i2] 
+
             for i in range(count):
                 w = W1[:, i]; d = Hinv1[i, i]
                 q = w.clone(); q[mask1[:, i]] = 0 
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 W[:, i1+i] = q
+
             W[:, i2:] -= (W[:, i1:i2] - W1) @ Hinv_cholesky[i1:i2, i2:]
             torch.cuda.empty_cache()
 
-        # 6. CONVERT BACK
+        # 7. CONVERT BACK
         if isinstance(self.layer, transformers.Conv1D): W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        print(f"  ASMP Pruning Done. Active Manifold Protected.")
+        print(f"  TAP Pruning Done. Topological Anchors Protected.")
         
     def free(self):
         if DEBUG:
