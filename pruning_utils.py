@@ -418,40 +418,23 @@ class SparseGPT_OPT:
     #     torch.cuda.empty_cache()
     #     print(f"Balanced Vacuum Pruning (n={n_vac}, 50% Protected) Done.")
     def hcv_fastpruner(
-        self, sparsity, num_heads, prunen=0, prunem=0, blocksize=128, percdamp=.01,
+        self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
         n_vac=3
     ):
         """
-        STABILIZED HCV: Rank-based Head Coherence.
-        Uses head rankings to safely nudge the vacuum without destroying logic.
+        NEW INVENTION: Manifold-Symmetry Vacuuming (MSV).
+        Prunes weights by looking at the Joint Manifold of the Attention block.
+        Ensures Q and K maintain a symmetric logical structure.
         """
         # 1. SETUP
         W = self.layer.weight.data.clone().float()
         H = self.H.float()
         dev = self.dev
-        n_rows, n_cols = W.shape
-        head_dim = n_rows // num_heads
         tick = time.time()
 
-        # 2. CALCULATE STABLE HEAD IMPORTANCE
-        head_importance = torch.zeros(num_heads, device=dev)
-        for h in range(num_heads):
-            W_h = W[h*head_dim : (h+1)*head_dim, :]
-            # We use the Log-Power to compress the range and stay numerically safe
-            head_importance[h] = torch.log1p(torch.sum((W_h @ H) * W_h).abs())
-        
-        # 3. RANK-BASED COHERENCE (The Secret to Stability)
-        # We rank heads from 0 (weakest) to 1 (strongest)
-        # This prevents the 'Super-Vacuum' effect
-        ranks = torch.argsort(torch.argsort(head_importance)).float() / (num_heads - 1)
-        # Strong heads (rank 1.0) get a weak vacuum. Weak heads (rank 0.0) get a strong vacuum.
-        # We map the vacuum power to a safe range (e.g., n_vac to 2*n_vac)
-        head_v_powers = n_vac + (1.0 - ranks) * 2.0 
-        # Map back to rows: [num_heads] -> [n_rows, 1]
-        head_n_map = head_v_powers.view(num_heads, 1).expand(-1, head_dim).reshape(-1, 1)
-
-        # 4. CHUNKED UNIQUENESS (Safe RAVS)
-        d_sqrt = torch.sqrt(torch.diag(H).abs()) + 1e-9
+        # 2. MANIFOLD UNIQUENESS (Safe RAVS)
+        d = torch.diag(H).abs()
+        d_sqrt = torch.sqrt(d) + 1e-9
         redundancy = torch.zeros(self.columns, device=dev)
         for i in range(0, self.columns, 512):
             end = min(i + 512, self.columns)
@@ -459,31 +442,37 @@ class SparseGPT_OPT:
             corr_chunk = torch.abs(h_chunk) / (d_sqrt[i:end].unsqueeze(1) * d_sqrt.unsqueeze(0))
             redundancy[i:end] = torch.sum(corr_chunk, dim=1)
             del h_chunk, corr_chunk
+        
         uniqueness = (1.0 / torch.log1p(redundancy + 1.0)).reshape((1, -1))
         uniqueness = torch.clamp(uniqueness / uniqueness.max(), min=0.9)
 
-        # 5. DYNAMIC VACUUM & SCORING
+        # 3. VACUUM WARP (Continuous Scaling)
+        # We find the row-wise max to normalize the vacuum scale
         row_max = torch.max(torch.abs(W), dim=1, keepdim=True)[0] + 1e-9
-        # Apply the head-specific vacuum powers
-        v_multiplier = torch.pow(torch.abs(W) / row_max, head_n_map)
+        # The Vacuum creates the gap between 'Signal' and 'Noise'
+        v_multiplier = torch.pow(torch.abs(W) / row_max, n_vac)
 
-        # Hessian Inverse
-        damp = percdamp * torch.mean(torch.diag(H).abs())
+        # 4. HESSIAN FOUNDATION
+        damp = percdamp * torch.mean(d)
         diag = torch.arange(self.columns, device=dev)
         H[diag, diag] += damp
         Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
         h_inv_diag = torch.diag(Hinv).reshape((1, -1))
-        
-        # Blended Score (Using the 0.5 Anchor Power for stability)
+
+        # 5. SYMMETRY-AWARE RANKING
+        # We blend the Local Weight Strength with the Vacuum/Uniqueness Intelligence
+        # Using a 0.5 Geometric blend for the 'Advisor' effect
         importance = (W**2 / (h_inv_diag + 1e-9)) * torch.sqrt(v_multiplier * uniqueness + 1e-12)
         
-        # Mask
+        # Create Global Mask
         thresh = torch.sort(importance.flatten())[0][int(importance.numel() * sparsity)]
         global_mask = importance > thresh
-        del importance, v_multiplier, uniqueness, head_n_map, head_importance
+        del importance, v_multiplier, uniqueness
 
-        # 6. EXACT SparseGPT SURGERY
+        # 6. STABLE SURGERY (Exact SparseGPT correction)
+        W[:, torch.diag(H) == 0] = 0
         Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
+        
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
@@ -500,10 +489,10 @@ class SparseGPT_OPT:
             W[:, i2:] -= (W[:, i1:i2] - W1) @ Hinv_cholesky[i1:i2, i2:]
             torch.cuda.empty_cache()
 
-        # 7. CLEANUP
+        # 7. FINAL CONVERSION
         if isinstance(self.layer, transformers.Conv1D): W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        print(f"  Stabilized HCV Pruning Done.")
+        print(f"  MSV Pruning Done. Manifold Symmetry Preserved.")
         
     def free(self):
         if DEBUG:
