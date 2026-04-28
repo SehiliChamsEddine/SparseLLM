@@ -250,7 +250,7 @@ class SparseGPT_OPT:
         print(f"Champion Vacuum Pruning (n={n_vac}) Done.")
     
         
-    def mha_fastpruner(
+    def mha_oip_fastpruner(
         self, sparsity, num_heads, prunen=0, prunem=0, blocksize=128, percdamp=.01
     ):
         """
