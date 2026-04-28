@@ -422,9 +422,9 @@ class SparseGPT_OPT:
         n_vac=3
     ):
         """
-        NEW INVENTION: Manifold-Symmetry Vacuuming (MSV).
-        Prunes weights by looking at the Joint Manifold of the Attention block.
-        Ensures Q and K maintain a symmetric logical structure.
+        TEACHER'S METHOD: Spectral Vacuum Pruning (SVP).
+        Decomposes weights into SVD, vacuums the singular values, 
+        and reconstructs the logical manifold.
         """
         # 1. SETUP
         W = self.layer.weight.data.clone().float()
@@ -432,47 +432,42 @@ class SparseGPT_OPT:
         dev = self.dev
         tick = time.time()
 
-        # 2. MANIFOLD UNIQUENESS (Safe RAVS)
-        d = torch.diag(H).abs()
-        d_sqrt = torch.sqrt(d) + 1e-9
-        redundancy = torch.zeros(self.columns, device=dev)
-        for i in range(0, self.columns, 512):
-            end = min(i + 512, self.columns)
-            h_chunk = H[i:end, :]
-            corr_chunk = torch.abs(h_chunk) / (d_sqrt[i:end].unsqueeze(1) * d_sqrt.unsqueeze(0))
-            redundancy[i:end] = torch.sum(corr_chunk, dim=1)
-            del h_chunk, corr_chunk
+        # 2. SPECTRAL VACUUMING (Teacher's Idea + Vacuum)
+        # We perform SVD to find the 'Logic Channels' of the layer
+        # W = U * S * Vh
+        U, S, Vh = torch.linalg.svd(W, full_matrices=False)
         
-        uniqueness = (1.0 / torch.log1p(redundancy + 1.0)).reshape((1, -1))
-        uniqueness = torch.clamp(uniqueness / uniqueness.max(), min=0.9)
+        # Apply Vacuum to Singular Values (S)
+        # This keeps the logic directions (U, Vh) but vacuums the noise energy
+        s_max = S.max() + 1e-9
+        # phi(s) = s * (s/max)^n
+        s_v_multiplier = torch.pow(S / s_max, n_vac)
+        S_vac = S * s_v_multiplier
+        
+        # Reconstruct the 'Cleaned' Weight Matrix
+        W_spectral = (U * S_vac.unsqueeze(0)) @ Vh
+        del U, S, Vh, S_vac, s_v_multiplier
 
-        # 3. VACUUM WARP (Continuous Scaling)
-        # We find the row-wise max to normalize the vacuum scale
-        row_max = torch.max(torch.abs(W), dim=1, keepdim=True)[0] + 1e-9
-        # The Vacuum creates the gap between 'Signal' and 'Noise'
-        v_multiplier = torch.pow(torch.abs(W) / row_max, n_vac)
-
-        # 4. HESSIAN FOUNDATION
-        damp = percdamp * torch.mean(d)
+        # 3. PREPARE HESSIAN FOUNDATION
+        damp = percdamp * torch.mean(torch.diag(H).abs())
         diag = torch.arange(self.columns, device=dev)
         H[diag, diag] += damp
         Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
         h_inv_diag = torch.diag(Hinv).reshape((1, -1))
-
-        # 5. SYMMETRY-AWARE RANKING
-        # We blend the Local Weight Strength with the Vacuum/Uniqueness Intelligence
-        # Using a 0.5 Geometric blend for the 'Advisor' effect
-        importance = (W**2 / (h_inv_diag + 1e-9)) * torch.sqrt(v_multiplier * uniqueness + 1e-12)
+        
+        # 4. RANKING IN SPECTRAL SPACE
+        # We use the Spectrally-Cleaned matrix to decide the mask
+        importance = (W_spectral**2 / (h_inv_diag + 1e-9))
         
         # Create Global Mask
         thresh = torch.sort(importance.flatten())[0][int(importance.numel() * sparsity)]
         global_mask = importance > thresh
-        del importance, v_multiplier, uniqueness
+        del importance, W_spectral
 
-        # 6. STABLE SURGERY (Exact SparseGPT correction)
+        # 5. STABLE SURGERY (Correct the error of the mask)
         W[:, torch.diag(H) == 0] = 0
         Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
-        
+
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
@@ -489,10 +484,10 @@ class SparseGPT_OPT:
             W[:, i2:] -= (W[:, i1:i2] - W1) @ Hinv_cholesky[i1:i2, i2:]
             torch.cuda.empty_cache()
 
-        # 7. FINAL CONVERSION
+        # 6. CONVERT BACK
         if isinstance(self.layer, transformers.Conv1D): W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        print(f"  MSV Pruning Done. Manifold Symmetry Preserved.")
+        print(f"  Spectral Vacuum Pruning Done. SVD-logic preserved.")
         
     def free(self):
         if DEBUG:
