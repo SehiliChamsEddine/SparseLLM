@@ -121,8 +121,11 @@ def opt_sparsellm(model, dataloader, dev, args):
                  
                               
                   
-                    # Use my new TAP invention
-                    gpts[name].topological_vacuum_pruner(args.sparsity, n_vac=args.n_vac)
+                    # # Use my new TAP invention
+                    # gpts[name].topological_vacuum_pruner(args.sparsity, n_vac=args.n_vac)
+                    # Use the new ISE Independence invention for Logic
+                    num_heads = model.config.num_attention_heads
+                    gpts[name].ise_mha_pruner(args.sparsity, num_heads=num_heads)
                 #     gpts[name].fasterprune_vacuum(
                 #     args.sparsity,
                 #     prunen=args.prunen,
