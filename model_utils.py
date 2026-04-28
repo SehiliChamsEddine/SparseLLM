@@ -119,11 +119,11 @@ def opt_sparsellm(model, dataloader, dev, args):
                 sparsity = args.sparsity
                 if args.use_vacuum :
                  
-                  
-                    gpts[name].hcv_fastpruner(
-                        args.sparsity, 
-                        n_vac=args.n_vac
-                                        )
+                              
+                    # Use the NEW Orthogonal Directional Pruner
+                    num_heads = model.config.num_attention_heads
+                    print(f"Pruning Attention {name} with OIP Geometry...")
+                    gpts[name].mha_oip_fastpruner(args.sparsity, num_heads=num_heads)
                 #     print('Pruning with VACUUM ...')
                 #     gpts[name].fasterprune_vacuum(
                 #     args.sparsity,
