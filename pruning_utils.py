@@ -250,85 +250,92 @@ class SparseGPT_OPT:
         print(f"Champion Vacuum Pruning (n={n_vac}) Done.")
     
         
-    def mha_oip_fastpruner(
-        self, sparsity, num_heads, prunen=0, prunem=0, blocksize=128, percdamp=.01
+    def hcv_joint_fastpruner(
+        self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
+        n_vac=2
     ):
         """
-        NEW METHOD: Orthogonal Information Pruning (OIP).
-        Specifically designed for MHA. Prunes weights that do not align 
-        with the head's principal geometric directions.
+        NEW INVENTION: Active-Signal Manifold Pruning (ASMP).
+        Combines Teacher's SVD logic with Data-Aware Hessian weighting.
+        Target: Beating the 117 PPL baseline.
         """
         # 1. SETUP
         W = self.layer.weight.data.clone().float()
         H = self.H.float()
         dev = self.dev
-        n_rows, n_cols = W.shape
-        head_dim = n_rows // num_heads
         tick = time.time()
 
-        # 2. GEOMETRIC DIRECTION DISCOVERY (Per Head)
-        # We find the 'Logical Axis' for each head using SVD
-        directional_alignment = torch.zeros_like(W)
-        
-        for h in range(num_heads):
-            # Slice the head
-            W_h = W[h*head_dim : (h+1)*head_dim, :] # [head_dim, d_model]
-            
-            # Find Principal Directions (SVD)
-            # We only need the top directions to define the 'Logic Manifold'
-            U, S, Vh = torch.linalg.svd(W_h, full_matrices=False)
-            
-            # The 'Core Logic' is the projection of weights onto their own principal components
-            # This measures how much each weight aligns with the head's main purpose
-            # W_aligned = U * S * Vh (but we use the magnitudes of the components)
-            W_h_aligned = torch.abs(W_h @ Vh.t()) @ Vh
-            directional_alignment[h*head_dim : (h+1)*head_dim, :] = W_h_aligned.abs()
-            
-            del U, S, Vh, W_h_aligned
-        
-        # 3. HESSIAN SENSITIVITY (The Safety Foundation)
+        # 2. ACTIVE SIGNAL DISCOVERY (The Teacher + Data Hybrid)
+        # We look at the weight's importance weighted by the Input Power (diag of H)
         d_diag = torch.diag(H).abs()
+        # Scale weights by the signal they actually carry
+        # W_active represents the 'Real Information Flow'
+        W_active = W * torch.sqrt(d_diag + 1e-9).reshape(1, -1)
+        
+        # SVD on the Active Signal to find the Principal Reasoning Manifold
+        with torch.no_grad():
+            # We use the top 25% of singular values to define the 'Signal'
+            U, S, Vh = torch.linalg.svd(W_active, full_matrices=False)
+            s_mask = torch.zeros_like(S)
+            k = max(1, len(S) // 4) 
+            s_mask[:k] = 1.0 # Keep only the top logical channels
+            
+            # Reconstruct the 'Logic Skeleton'
+            W_manifold = (U * (S * s_mask).unsqueeze(0)) @ Vh
+            # The 'Manifold Survival Score'
+            # Weights that align with the Active Manifold get a huge bonus
+            manifold_nudge = W_manifold.abs()
+            del U, S, Vh, W_manifold, s_mask, W_active
+
+        # 3. HESSIAN PREPARATION
         damp = percdamp * torch.mean(d_diag)
         diag = torch.arange(self.columns, device=dev)
-        H[diag, diag] += damp
-        Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
+        H_tmp = H.clone()
+        H_tmp[diag, diag] += damp
+        Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H_tmp))
         h_inv_diag = torch.diag(Hinv).reshape((1, -1))
-        del H
+        del H_tmp
 
-        # 4. OIP IMPORTANCE SCORE
-        # We combine: (Standard Sensitivity) * (Geometric Alignment)
-        # This protects weights that are directionally important to the head
-        # No Vacuuming here. Pure geometric selection.
-        importance = (W**2 / (h_inv_diag + 1e-9)) * (directional_alignment + 1e-12)
-        del directional_alignment
-
-        # 5. MASKING
+        # 4. THE ASMP CHAMPION SCORE
+        # base = Standard SparseGPT (The 117 PPL foundation)
+        base_score = W**2 / (h_inv_diag + 1e-9)
+        
+        # We use the Vacuum to 'clean' the manifold nudge
+        # This creates a sharp gap between 'Logic' and 'Noise'
+        max_m = manifold_nudge.max() + 1e-12
+        v_nudge = torch.pow(manifold_nudge / max_m, n_vac)
+        
+        # FINAL FORMULA: Base * (Active Manifold)^0.2
+        # A 0.2 power ensures the manifold logic guides the decision 
+        # but the Hessian safety math stays in control.
+        importance = base_score * torch.pow(v_nudge + 1e-12, 0.2)
+        
+        # Create Global Mask
         thresh = torch.sort(importance.flatten())[0][int(importance.numel() * sparsity)]
         global_mask = importance > thresh
-        del importance
+        del importance, v_nudge, manifold_nudge
 
-        # 6. STABLE SURGERY (Exact OBS Correction)
+        # 5. EXACT SURGERY (The correction)
+        W_orig = W.clone()
         Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
             W1 = W[:, i1:i2].clone(); Hinv1 = Hinv[i1:i2, i1:i2]
             mask1 = ~global_mask[:, i1:i2] 
-
             for i in range(count):
                 w = W1[:, i]; d = Hinv1[i, i]
                 q = w.clone(); q[mask1[:, i]] = 0 
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 W[:, i1+i] = q
-
             W[:, i2:] -= (W[:, i1:i2] - W1) @ Hinv_cholesky[i1:i2, i2:]
             torch.cuda.empty_cache()
 
-        # 7. CLEANUP
+        # 6. CONVERT BACK
         if isinstance(self.layer, transformers.Conv1D): W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        print(f"  OIP Pruning Done. Geometric Logic Preserved.")
+        print(f"  ASMP Pruning Done. Active Manifold Protected.")
         
     def free(self):
         if DEBUG:
