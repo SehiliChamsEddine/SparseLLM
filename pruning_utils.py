@@ -250,7 +250,7 @@ class SparseGPT_OPT:
     #     print(f"Champion Vacuum Pruning (n={n_vac}) Done.")
     def fasterprune_vacuum(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
-        n_vac=3
+        n_vac=3 , lmbda=0, cooking_iters=0, lr_vac=0
     ):
         """
         TEACHER'S FINAL HYBRID: Row-Wise Vacuum + Spectral Damping.
