@@ -118,11 +118,10 @@ def opt_sparsellm(model, dataloader, dev, args):
                 # Prune the layer
                 sparsity = args.sparsity
                 if args.use_vacuum :
-                    # Logic Layers: Use Head-Coherence Vacuuming
-                    num_heads = model.config.num_attention_heads
+                 
+                  
                     gpts[name].hcv_fastpruner(
                         args.sparsity, 
-                        num_heads=num_heads,
                         n_vac=args.n_vac
                                         )
                 #     print('Pruning with VACUUM ...')
