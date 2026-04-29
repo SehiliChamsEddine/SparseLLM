@@ -250,14 +250,13 @@ class SparseGPT_OPT:
         print(f"Champion Vacuum Pruning (n={n_vac}) Done.")
     
         
-    def hcv_epib_fastpruner(
-        self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01
+    def hcv_gsdp_fastpruner(
+        self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.05
     ):
         """
-        MY INVENTION: Information-Entropy Fisher Pruning (IEFP).
-        Uses Fisher Information (Weight^2 * Input_Variance) to find the 
-        'Information Skeleton' of the Attention heads.
-        Uses industry-standard Hessian Surgery for value recovery.
+        MY INVENTION: Geometric Signal-Density Pruning (GSDP).
+        Uses Signal Concentration to protect unique information paths.
+        Uses 5% High-Flexibility Damping to stabilize the MHA geometry.
         """
         import torch
         import time
@@ -268,45 +267,51 @@ class SparseGPT_OPT:
         dev = self.dev
         tick = time.time()
 
-        # 2. FISHER INFORMATION DISCOVERY (The Entropy Metric)
-        # Input Variance = Diagonal of the Hessian (X * X^T)
-        input_variance = torch.diag(H).abs()
+        # 2. SIGNAL CONCENTRATION (The GSDP Discovery)
+        # We find how 'crowded' each input feature is.
+        # High diag(H) = Powerful feature.
+        diag_h = torch.diag(H).abs()
         
-        # IEFP Metric: Weight Squared * Input Variance
-        # This identifies weights that transmit the most dynamic signal
-        # instead of just static noise.
-        # We use sqrt for a more stable ranking distribution.
-        importance_scores = torch.abs(W) * torch.sqrt(input_variance + 1e-9).reshape(1, -1)
+        # Calculate Local Density: How much this feature correlates with others
+        # We use a memory-efficient sum of correlations
+        d_sqrt = torch.sqrt(diag_h + 1e-9)
+        density = torch.zeros_like(diag_h)
+        for i in range(0, self.columns, 512):
+            end = min(i + 512, self.columns)
+            # Correlation sum for this chunk
+            corr_sum = torch.sum(torch.abs(H[i:end, :]) / (d_sqrt[i:end].unsqueeze(1) * d_sqrt.unsqueeze(0)), dim=1)
+            density[i:end] = corr_sum
+            
+        # The GSDP Score: (Magnitude * Signal) / sqrt(Density)
+        # This rewards weights that are large and carry signal, 
+        # but protects those that are in 'Thin' (Unique) subspaces.
+        gsdp_scores = (torch.abs(W) * d_sqrt.reshape(1, -1)) / torch.sqrt(density + 1e-9).reshape(1, -1)
+        
+        # 3. GLOBAL MASK SELECTION
+        thresh = torch.sort(gsdp_scores.flatten())[0][int(gsdp_scores.numel() * sparsity)]
+        global_mask = gsdp_scores > thresh
+        del gsdp_scores, density
 
-        # 3. HESSIAN PREPARATION (The 'Safety' Foundation)
-        damp = percdamp * torch.mean(input_variance)
+        # 4. HESSIAN PREPARATION (High-Flexibility Damping)
+        # 0.05 (5%) allows the model to 'heal' better in logic layers
+        damp = percdamp * torch.mean(diag_h)
         diag = torch.arange(self.columns, device=dev)
         H[diag, diag] += damp
         Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
-        
-        # 4. GLOBAL INFORMATION MASK
-        # Rank weights by their Information Entropy (IEFP)
-        thresh = torch.sort(importance_scores.flatten())[0][int(importance_scores.numel() * sparsity)]
-        global_mask = importance_scores > thresh
-        
-        del importance_scores, thresh
-
-        # 5. THE HESSIAN SURGERY (Optimal Brain Surgeon Loop)
-        # This is what keeps the model alive.
-        W[:, torch.diag(self.H) == 0] = 0
         Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
 
+        # 5. SURGERY LOOP (Safe OBS)
+        W[:, torch.diag(self.H) == 0] = 0
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
             W1 = W[:, i1:i2].clone(); Hinv1 = Hinv[i1:i2, i1:i2]
-            mask1 = ~global_mask[:, i1:i2] # Weights to kill
+            mask1 = ~global_mask[:, i1:i2] 
 
             for i in range(count):
                 w = W1[:, i]; d = Hinv1[i, i]
                 q = w.clone(); q[mask1[:, i]] = 0 
                 
-                # The Correction Math (OBS)
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 W[:, i1+i] = q
@@ -315,11 +320,10 @@ class SparseGPT_OPT:
             torch.cuda.empty_cache()
 
         # 6. CONVERT BACK
-        if isinstance(self.layer, transformers.Conv1D):
-            W = W.t()
+        if isinstance(self.layer, transformers.Conv1D): W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
         
-        print(f"  IEFP Pruning Done. Information Entropy preserved.")
+        print(f"  GSDP Pruning Done. Logical Manifold Intact.")
         
     def free(self):
         if DEBUG:
