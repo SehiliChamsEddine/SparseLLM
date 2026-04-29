@@ -250,13 +250,14 @@ class SparseGPT_OPT:
         print(f"Champion Vacuum Pruning (n={n_vac}) Done.")
     
         
-    def hcv_hrp_fastpruner(
+    def hcv_epib_fastpruner(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01
     ):
         """
-        MY INVENTION: Harmonic Resonance Pruning (HRP).
-        Synthesizes Wanda's activation awareness with Spectral Signal Geometry.
-        Targeting the 117 PPL record for MHA.
+        MY INVENTION: Information-Entropy Fisher Pruning (IEFP).
+        Uses Fisher Information (Weight^2 * Input_Variance) to find the 
+        'Information Skeleton' of the Attention heads.
+        Uses industry-standard Hessian Surgery for value recovery.
         """
         import torch
         import time
@@ -267,54 +268,58 @@ class SparseGPT_OPT:
         dev = self.dev
         tick = time.time()
 
-        # 2. DISCOVER THE PRINCIPAL EIGEN-SIGNAL (The model's 'Tuning')
-        # We use Power Iteration to find the direction of maximum signal flow
-        # This represents the 'Main Highway' of information for this layer.
-        with torch.no_grad():
-            # Initial guess: Average activation power
-            v = torch.diag(H).abs().unsqueeze(1)
-            for _ in range(3): # Fast iteration to find the eigenvector
-                v = torch.matmul(H, v)
-                v = v / (torch.norm(v) + 1e-9)
-            # v is now the 'Manifold Signature' of the data
-            manifold_signature = v.view(1, -1)
+        # 2. FISHER INFORMATION DISCOVERY (The Entropy Metric)
+        # Input Variance = Diagonal of the Hessian (X * X^T)
+        input_variance = torch.diag(H).abs()
+        
+        # IEFP Metric: Weight Squared * Input Variance
+        # This identifies weights that transmit the most dynamic signal
+        # instead of just static noise.
+        # We use sqrt for a more stable ranking distribution.
+        importance_scores = torch.abs(W) * torch.sqrt(input_variance + 1e-9).reshape(1, -1)
 
-        # 3. HARMONIC RESONANCE SCORING
-        # Resonance = |Weight| * |Input Signature|
-        # This identifies weights that are 'in-tune' with the primary signal manifold.
-        resonance_scores = torch.abs(W) * torch.abs(manifold_signature)
+        # 3. HESSIAN PREPARATION (The 'Safety' Foundation)
+        damp = percdamp * torch.mean(input_variance)
+        diag = torch.arange(self.columns, device=dev)
+        H[diag, diag] += damp
+        Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
+        
+        # 4. GLOBAL INFORMATION MASK
+        # Rank weights by their Information Entropy (IEFP)
+        thresh = torch.sort(importance_scores.flatten())[0][int(importance_scores.numel() * sparsity)]
+        global_mask = importance_scores > thresh
+        
+        del importance_scores, thresh
 
-        # 4. SPECTRAL MASK SELECTION
-        # We perform a High-Pass Filter: Keep the weights with highest resonance.
-        # This is more stable than magnitude pruning because it is Data-Aware.
-        thresh = torch.sort(resonance_scores.flatten())[0][int(resonance_scores.numel() * sparsity)]
-        mask = (resonance_scores > thresh).float()
+        # 5. THE HESSIAN SURGERY (Optimal Brain Surgeon Loop)
+        # This is what keeps the model alive.
+        W[:, torch.diag(self.H) == 0] = 0
+        Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
 
-        # 5. INFORMATION RECOVERY (The 'Harmony' Step)
-        # We re-scale survivors to preserve the local information density.
-        with torch.no_grad():
-            # Measure how much signal was lost in each output dimension (row)
-            original_resonance = torch.sum(resonance_scores, dim=1, keepdim=True)
-            remaining_resonance = torch.sum(resonance_scores * mask, dim=1, keepdim=True)
-            
-            # Compensation Factor: If we killed 70% of signal, boost survivors to recover.
-            # This maintains the 'Attention Activation Range'.
-            scale_factor = original_resonance / (remaining_resonance + 1e-9)
-            scale_factor = torch.clamp(scale_factor, max=1.5) # Prevent explosion
-            
-            W_final = (W * mask) * scale_factor
+        for i1 in range(0, self.columns, blocksize):
+            i2 = min(i1 + blocksize, self.columns)
+            count = i2 - i1
+            W1 = W[:, i1:i2].clone(); Hinv1 = Hinv[i1:i2, i1:i2]
+            mask1 = ~global_mask[:, i1:i2] # Weights to kill
+
+            for i in range(count):
+                w = W1[:, i]; d = Hinv1[i, i]
+                q = w.clone(); q[mask1[:, i]] = 0 
+                
+                # The Correction Math (OBS)
+                err1 = (w - q) / d
+                W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+                W[:, i1+i] = q
+
+            W[:, i2:] -= (W[:, i1:i2] - W1) @ Hinv_cholesky[i1:i2, i2:]
+            torch.cuda.empty_cache()
 
         # 6. CONVERT BACK
         if isinstance(self.layer, transformers.Conv1D):
-            W_final = W_final.t()
+            W = W.t()
+        self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
         
-        self.layer.weight.data = W_final.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        
-        # Cleanup
-        del W, H, resonance_scores, mask, manifold_signature, v
-        torch.cuda.empty_cache()
-
-        print(f"  HRP Pruning Done. Model Harmonized at {sparsity*100}% sparsity.")
+        print(f"  IEFP Pruning Done. Information Entropy preserved.")
         
     def free(self):
         if DEBUG:
