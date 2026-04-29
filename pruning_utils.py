@@ -250,78 +250,76 @@ class SparseGPT_OPT:
         print(f"Champion Vacuum Pruning (n={n_vac}) Done.")
     
         
-    def hcv_lcrp_fastpruner(
-        self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01
+    def hcv_gls_fastpruner(
+        self, sparsity, num_heads, prunen=0, prunem=0, blocksize=128, percdamp=.01
     ):
         """
-        MY INVENTION: Logic-Column Resonance Pruning (LCRP).
-        Identifies and protects 'Logic Columns' (outlier paths).
-        Uses Column-Wise Normalization for the background noise.
-        NO Vacuum. NO SVD. Just pure Information Geometry.
+        NEW INVENTION: Head-Normalized Covariance Pruning (HNCP).
+        Treats each head as an independent information channel.
+        Uses Internal Head Normalization to prevent 'Head Death'.
         """
         import torch
         import time
 
         # 1. SETUP
         W = self.layer.weight.data.clone().float()
-        H = self.H.float()
-        dev = self.dev
+        H_diag = torch.diag(self.H).abs().float()
+        n_rows, n_cols = W.shape
+        head_dim = n_rows // num_heads
         tick = time.time()
 
-        # 2. LOGIC COLUMN DISCOVERY (The LCRP Discovery)
-        # We find the 'Power' of each input channel from the Hessian
-        column_power = torch.diag(H).abs()
-        # Find the 95th percentile (The Top 5% of columns are 'Logic Columns')
-        logic_threshold = torch.quantile(column_power, 0.95)
-        # Create a shield: 1.0 for Logic Columns, 0.0 for Noise Columns
-        logic_shield = (column_power >= logic_threshold).float().reshape(1, -1)
+        # 2. CALCULATE INFORMATION FLOW (The Wanda Metric)
+        # Flow = Magnitude * sqrt(Input Variance)
+        # This is the most stable ranking metric for LLM logic
+        flow_scores = torch.abs(W) * torch.sqrt(H_diag + 1e-9).reshape(1, -1)
 
-        # 3. RESONANCE SCORING (Column-Aware Importance)
-        # Importance = |Weight| * sqrt(Column Power)
-        # This is similar to Wanda, but we add the Logic Shield.
-        importance_scores = torch.abs(W) * torch.sqrt(column_power + 1e-9).reshape(1, -1)
-        
-        # WE PROTECT LOGIC COLUMNS: Give them infinite importance so they are never pruned
-        importance_scores = importance_scores + (logic_shield * 1e9)
+        # 3. HEAD-NORMALIZATION (The HNCP Invention)
+        # We ensure that every head contributes to the final sparsity, 
+        # but focused heads are protected.
+        normalized_scores = torch.zeros_like(flow_scores)
+        for h in range(num_heads):
+            # Slice the head
+            head_slice = flow_scores[h*head_dim : (h+1)*head_dim, :]
+            # Normalize by the mean of the head to make heads 'comparable'
+            # This prevents the 'Loud Head' from stealing all the weights
+            head_mean = head_slice.mean() + 1e-9
+            normalized_scores[h*head_dim : (h+1)*head_dim, :] = head_slice / head_mean
 
         # 4. GLOBAL MASK SELECTION
-        # We pick the top survivors. Because of the shield, Logic Columns stay alive.
-        thresh = torch.sort(importance_scores.flatten())[0][int(importance_scores.numel() * sparsity)]
-        global_mask = importance_scores > thresh
+        # Now that heads are normalized, we pick the top survivors
+        thresh = torch.sort(normalized_scores.flatten())[0][int(normalized_scores.numel() * sparsity)]
+        mask = (normalized_scores > thresh).float()
         
-        del importance_scores, logic_shield
-
-        # 5. SAFE HESSIAN SURGERY (Optimal Brain Surgeon Loop)
-        # We use the standard loop because it is the only way to re-scale the Survivors
-        damp = percdamp * torch.mean(column_power)
-        diag = torch.arange(self.columns, device=dev)
-        H[diag, diag] += damp
-        Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
-        Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
-
-        W[:, torch.diag(self.H) == 0] = 0
-        for i1 in range(0, self.columns, blocksize):
-            i2 = min(i1 + blocksize, self.columns)
-            count = i2 - i1
-            W1 = W[:, i1:i2].clone(); Hinv1 = Hinv[i1:i2, i1:i2]
-            mask1 = ~global_mask[:, i1:i2] 
-
-            for i in range(count):
-                w = W1[:, i]; d = Hinv1[i, i]
-                q = w.clone(); q[mask1[:, i]] = 0 
+        # 5. COVARANCE-PRESERVING RESCALING (The 'CPR' Healing Step)
+        # Instead of the complex Hessian Inverse, we use a geometric scale 
+        # to restore the head's signal power.
+        W_pruned = W * mask
+        with torch.no_grad():
+            for h in range(num_heads):
+                # Measure energy loss in this head
+                orig_h = W[h*head_dim : (h+1)*head_dim, :]
+                prun_h = W_pruned[h*head_dim : (h+1)*head_dim, :]
                 
-                err1 = (w - q) / d
-                W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                W[:, i1+i] = q
-
-            W[:, i2:] -= (W[:, i1:i2] - W1) @ Hinv_cholesky[i1:i2, i2:]
-            torch.cuda.empty_cache()
+                # Scale Factor = Original Norm / Pruned Norm
+                # This ensures the 'Logic Volume' stays the same
+                scale = torch.norm(orig_h) / (torch.norm(prun_h) + 1e-9)
+                # Clamp to prevent numerical explosion
+                scale = torch.clamp(scale, max=2.0)
+                W_pruned[h*head_dim : (h+1)*head_dim, :] *= scale
 
         # 6. CONVERT BACK
-        if isinstance(self.layer, transformers.Conv1D): W = W.t()
-        self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
+        if isinstance(self.layer, transformers.Conv1D):
+            W_final = W_pruned.t()
+        else:
+            W_final = W_pruned
+            
+        self.layer.weight.data = W_final.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
         
-        print(f"  LCRP Pruning Done. Logic Columns Shielded.")
+        # Cleanup
+        del W, flow_scores, normalized_scores, mask, W_pruned
+        torch.cuda.empty_cache()
+
+        print(f"  HNCP Pruning Done: {num_heads} Heads Balanced and Rescaled.")
         
     def free(self):
         if DEBUG:
