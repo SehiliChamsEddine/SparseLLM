@@ -250,76 +250,85 @@ class SparseGPT_OPT:
         print(f"Champion Vacuum Pruning (n={n_vac}) Done.")
     
         
-    def hcv_gls_fastpruner(
+    def hcv_chib_fastpruner(
         self, sparsity, num_heads, prunen=0, prunem=0, blocksize=128, percdamp=.01
     ):
         """
-        NEW INVENTION: Head-Normalized Covariance Pruning (HNCP).
-        Treats each head as an independent information channel.
-        Uses Internal Head Normalization to prevent 'Head Death'.
+        NEW INVENTION: Cross-Head Information Bottleneck (CHIB).
+        Identifies 'Broadcaster' columns that carry unique cross-head logic.
+        Uses CHIB to pick the mask and SparseGPT to fix the values.
         """
         import torch
         import time
 
         # 1. SETUP
         W = self.layer.weight.data.clone().float()
-        H_diag = torch.diag(self.H).abs().float()
+        H = self.H.float()
         n_rows, n_cols = W.shape
         head_dim = n_rows // num_heads
+        dev = self.dev
         tick = time.time()
 
-        # 2. CALCULATE INFORMATION FLOW (The Wanda Metric)
-        # Flow = Magnitude * sqrt(Input Variance)
-        # This is the most stable ranking metric for LLM logic
-        flow_scores = torch.abs(W) * torch.sqrt(H_diag + 1e-9).reshape(1, -1)
+        # 2. BROADCAST UTILITY DISCOVERY (The CHIB Invention)
+        # Power of each input feature
+        d_diag = torch.diag(H).abs()
+        # Crosstalk = sum of absolute correlations per column
+        # This identifies which inputs are 'unique' vs 'redundant'
+        crosstalk = torch.sum(torch.abs(H), dim=1)
+        # Utility: High Power / High Crosstalk ratio
+        utility = d_diag / (crosstalk + 1e-9)
+        utility = utility.reshape((1, -1)) # Broadcaster score
 
-        # 3. HEAD-NORMALIZATION (The HNCP Invention)
-        # We ensure that every head contributes to the final sparsity, 
-        # but focused heads are protected.
-        normalized_scores = torch.zeros_like(flow_scores)
+        # 3. CHIB SIGNAL SCORING
+        # Signal = |W| * sqrt(H) * Utility
+        # This protects unique information highways
+        signal_scores = torch.abs(W) * torch.sqrt(d_diag + 1e-9).reshape(1, -1) * utility
+
+        # 4. HEAD-NORMALIZATION
+        # Normalize scores within each head to ensure logical balance
+        normalized_scores = torch.zeros_like(signal_scores)
         for h in range(num_heads):
-            # Slice the head
-            head_slice = flow_scores[h*head_dim : (h+1)*head_dim, :]
-            # Normalize by the mean of the head to make heads 'comparable'
-            # This prevents the 'Loud Head' from stealing all the weights
-            head_mean = head_slice.mean() + 1e-9
-            normalized_scores[h*head_dim : (h+1)*head_dim, :] = head_slice / head_mean
+            idx = slice(h*head_dim, (h+1)*head_dim)
+            head_score = signal_scores[idx, :]
+            normalized_scores[idx, :] = head_score / (head_score.mean() + 1e-9)
 
-        # 4. GLOBAL MASK SELECTION
-        # Now that heads are normalized, we pick the top survivors
+        # 5. MASK SELECTION
         thresh = torch.sort(normalized_scores.flatten())[0][int(normalized_scores.numel() * sparsity)]
-        mask = (normalized_scores > thresh).float()
+        global_mask = normalized_scores > thresh
         
-        # 5. COVARANCE-PRESERVING RESCALING (The 'CPR' Healing Step)
-        # Instead of the complex Hessian Inverse, we use a geometric scale 
-        # to restore the head's signal power.
-        W_pruned = W * mask
-        with torch.no_grad():
-            for h in range(num_heads):
-                # Measure energy loss in this head
-                orig_h = W[h*head_dim : (h+1)*head_dim, :]
-                prun_h = W_pruned[h*head_dim : (h+1)*head_dim, :]
+        del signal_scores, normalized_scores, utility, crosstalk
+
+        # 6. HESSIAN SURGERY (The 'Healing' Step)
+        # We use the industry-standard loop because it is the only way to hit 117 PPL.
+        damp = percdamp * torch.mean(d_diag)
+        diag = torch.arange(self.columns, device=dev)
+        H[diag, diag] += damp
+        Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
+        Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
+        del H, d_diag
+
+        W[:, torch.diag(self.H) == 0] = 0
+        for i1 in range(0, self.columns, blocksize):
+            i2 = min(i1 + blocksize, self.columns)
+            count = i2 - i1
+            W1 = W[:, i1:i2].clone(); Hinv1 = Hinv[i1:i2, i1:i2]
+            mask1 = ~global_mask[:, i1:i2] 
+
+            for i in range(count):
+                w = W1[:, i]; d = Hinv1[i, i]
+                q = w.clone(); q[mask1[:, i]] = 0 
                 
-                # Scale Factor = Original Norm / Pruned Norm
-                # This ensures the 'Logic Volume' stays the same
-                scale = torch.norm(orig_h) / (torch.norm(prun_h) + 1e-9)
-                # Clamp to prevent numerical explosion
-                scale = torch.clamp(scale, max=2.0)
-                W_pruned[h*head_dim : (h+1)*head_dim, :] *= scale
+                err1 = (w - q) / d
+                W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+                W[:, i1+i] = q
 
-        # 6. CONVERT BACK
-        if isinstance(self.layer, transformers.Conv1D):
-            W_final = W_pruned.t()
-        else:
-            W_final = W_pruned
-            
-        self.layer.weight.data = W_final.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        
-        # Cleanup
-        del W, flow_scores, normalized_scores, mask, W_pruned
-        torch.cuda.empty_cache()
+            W[:, i2:] -= (W[:, i1:i2] - W1) @ Hinv_cholesky[i1:i2, i2:]
+            torch.cuda.empty_cache()
 
-        print(f"  HNCP Pruning Done: {num_heads} Heads Balanced and Rescaled.")
+        # 7. CONVERT BACK
+        if isinstance(self.layer, transformers.Conv1D): W = W.t()
+        self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
+        print(f"  CHIB Pruning Done. Information Bottlenecks protected.")
         
     def free(self):
         if DEBUG:
