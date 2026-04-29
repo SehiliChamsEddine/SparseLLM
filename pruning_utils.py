@@ -250,13 +250,13 @@ class SparseGPT_OPT:
         print(f"Champion Vacuum Pruning (n={n_vac}) Done.")
     
         
-    def hcv_asgp_fastpruner(
+    def hcv_hrp_fastpruner(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01
     ):
         """
-        MY OWN INVENTION: Active-Signal Geometry Preservation (ASGP).
-        No Hessian Inverse. No Vacuum. No Overfitting.
-        Prunes based on Information Flow and performs Energy Recycling.
+        MY INVENTION: Harmonic Resonance Pruning (HRP).
+        Synthesizes Wanda's activation awareness with Spectral Signal Geometry.
+        Targeting the 117 PPL record for MHA.
         """
         import torch
         import time
@@ -267,52 +267,54 @@ class SparseGPT_OPT:
         dev = self.dev
         tick = time.time()
 
-        # 2. SIGNAL POWER DISCOVERY
-        # We look at the energy of the inputs (The 'Loudness' of the data)
-        input_power = torch.diag(H).abs()
-        # sqrt of power gives us the 'Signal Magnitude'
-        signal_magnitude = torch.sqrt(input_power + 1e-9).reshape(1, -1)
-
-        # 3. INTERACTION RANKING (The ASGP Score)
-        # We rank weights by how much 'Real Signal' they pass
-        # Importance = Weight Magnitude * Input Signal Magnitude
-        # This identifies the 'Highways' of the Attention block.
-        importance_scores = torch.abs(W) * signal_magnitude
-
-        # 4. GLOBAL MASK SELECTION
-        # We pick the top survivors across the entire layer at once
-        thresh = torch.sort(importance_scores.flatten())[0][int(importance_scores.numel() * sparsity)]
-        mask = (importance_scores > thresh).float()
-        
-        # 5. ENERGY RECYCLING (The 'Healing' Step)
-        # When we kill weights, the output signal becomes 'quiet'.
-        # We calculate the loss of energy and boost the survivors to compensate.
+        # 2. DISCOVER THE PRINCIPAL EIGEN-SIGNAL (The model's 'Tuning')
+        # We use Power Iteration to find the direction of maximum signal flow
+        # This represents the 'Main Highway' of information for this layer.
         with torch.no_grad():
-            # Original signal energy per row (output neuron)
-            orig_energy = torch.sum(importance_scores, dim=1, keepdim=True)
-            # Remaining signal energy after pruning
-            pruned_energy = torch.sum(importance_scores * mask, dim=1, keepdim=True)
+            # Initial guess: Average activation power
+            v = torch.diag(H).abs().unsqueeze(1)
+            for _ in range(3): # Fast iteration to find the eigenvector
+                v = torch.matmul(H, v)
+                v = v / (torch.norm(v) + 1e-9)
+            # v is now the 'Manifold Signature' of the data
+            manifold_signature = v.view(1, -1)
+
+        # 3. HARMONIC RESONANCE SCORING
+        # Resonance = |Weight| * |Input Signature|
+        # This identifies weights that are 'in-tune' with the primary signal manifold.
+        resonance_scores = torch.abs(W) * torch.abs(manifold_signature)
+
+        # 4. SPECTRAL MASK SELECTION
+        # We perform a High-Pass Filter: Keep the weights with highest resonance.
+        # This is more stable than magnitude pruning because it is Data-Aware.
+        thresh = torch.sort(resonance_scores.flatten())[0][int(resonance_scores.numel() * sparsity)]
+        mask = (resonance_scores > thresh).float()
+
+        # 5. INFORMATION RECOVERY (The 'Harmony' Step)
+        # We re-scale survivors to preserve the local information density.
+        with torch.no_grad():
+            # Measure how much signal was lost in each output dimension (row)
+            original_resonance = torch.sum(resonance_scores, dim=1, keepdim=True)
+            remaining_resonance = torch.sum(resonance_scores * mask, dim=1, keepdim=True)
             
-            # The Recycle Factor: How much to boost survivors?
-            # This ensures the 'Volume' of the model stays the same.
-            recycle_factor = orig_energy / (pruned_energy + 1e-9)
-            # Clamp to prevent extreme values
-            recycle_factor = torch.clamp(recycle_factor, max=2.0)
+            # Compensation Factor: If we killed 70% of signal, boost survivors to recover.
+            # This maintains the 'Attention Activation Range'.
+            scale_factor = original_resonance / (remaining_resonance + 1e-9)
+            scale_factor = torch.clamp(scale_factor, max=1.5) # Prevent explosion
             
-            W_final = (W * mask) * recycle_factor
+            W_final = (W * mask) * scale_factor
 
         # 6. CONVERT BACK
         if isinstance(self.layer, transformers.Conv1D):
             W_final = W_final.t()
         
-        # Cast back to model dtype (e.g., half/fp16)
         self.layer.weight.data = W_final.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
         
-        # Memory Cleanup
-        del W, H, importance_scores, mask, recycle_factor, signal_magnitude, input_power
+        # Cleanup
+        del W, H, resonance_scores, mask, manifold_signature, v
         torch.cuda.empty_cache()
 
-        print(f"  ASGP Pruning Done. Signal Highways Preserved.")
+        print(f"  HRP Pruning Done. Model Harmonized at {sparsity*100}% sparsity.")
         
     def free(self):
         if DEBUG:
