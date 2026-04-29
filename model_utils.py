@@ -123,8 +123,8 @@ def opt_sparsellm(model, dataloader, dev, args):
                   
                     # # Use my new TAP invention
                     # gpts[name].topological_vacuum_pruner(args.sparsity, n_vac=args.n_vac)
-                   # Use my new SCP Structured invention (The most stable logic)
-                    gpts[name].hcv_scp_fastpruner(args.sparsity)
+                   # Use my new MIRF invention (Redundancy Filtering)
+                    gpts[name].hcv_mirf_fastpruner(args.sparsity)
                 #     gpts[name].fasterprune_vacuum(
                 #     args.sparsity,
                 #     prunen=args.prunen,
