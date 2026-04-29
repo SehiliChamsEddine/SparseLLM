@@ -123,8 +123,8 @@ def opt_sparsellm(model, dataloader, dev, args):
                   
                     # # Use my new TAP invention
                     # gpts[name].topological_vacuum_pruner(args.sparsity, n_vac=args.n_vac)
-                    # Use my new ASGP Signal-Highway invention
-                    gpts[name].hcv_hrp_fastpruner(args.sparsity)
+                    # Use my new IEFP Information invention
+                    gpts[name].hcv_epib_fastpruner(args.sparsity)
                 #     gpts[name].fasterprune_vacuum(
                 #     args.sparsity,
                 #     prunen=args.prunen,
