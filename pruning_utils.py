@@ -250,13 +250,14 @@ class SparseGPT_OPT:
         print(f"Champion Vacuum Pruning (n={n_vac}) Done.")
     
         
-    def hcv_gsdp_fastpruner(
-        self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.05
+    def hcv_lcrp_fastpruner(
+        self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01
     ):
         """
-        MY INVENTION: Geometric Signal-Density Pruning (GSDP).
-        Uses Signal Concentration to protect unique information paths.
-        Uses 5% High-Flexibility Damping to stabilize the MHA geometry.
+        MY INVENTION: Logic-Column Resonance Pruning (LCRP).
+        Identifies and protects 'Logic Columns' (outlier paths).
+        Uses Column-Wise Normalization for the background noise.
+        NO Vacuum. NO SVD. Just pure Information Geometry.
         """
         import torch
         import time
@@ -267,40 +268,37 @@ class SparseGPT_OPT:
         dev = self.dev
         tick = time.time()
 
-        # 2. SIGNAL CONCENTRATION (The GSDP Discovery)
-        # We find how 'crowded' each input feature is.
-        # High diag(H) = Powerful feature.
-        diag_h = torch.diag(H).abs()
-        
-        # Calculate Local Density: How much this feature correlates with others
-        # We use a memory-efficient sum of correlations
-        d_sqrt = torch.sqrt(diag_h + 1e-9)
-        density = torch.zeros_like(diag_h)
-        for i in range(0, self.columns, 512):
-            end = min(i + 512, self.columns)
-            # Correlation sum for this chunk
-            corr_sum = torch.sum(torch.abs(H[i:end, :]) / (d_sqrt[i:end].unsqueeze(1) * d_sqrt.unsqueeze(0)), dim=1)
-            density[i:end] = corr_sum
-            
-        # The GSDP Score: (Magnitude * Signal) / sqrt(Density)
-        # This rewards weights that are large and carry signal, 
-        # but protects those that are in 'Thin' (Unique) subspaces.
-        gsdp_scores = (torch.abs(W) * d_sqrt.reshape(1, -1)) / torch.sqrt(density + 1e-9).reshape(1, -1)
-        
-        # 3. GLOBAL MASK SELECTION
-        thresh = torch.sort(gsdp_scores.flatten())[0][int(gsdp_scores.numel() * sparsity)]
-        global_mask = gsdp_scores > thresh
-        del gsdp_scores, density
+        # 2. LOGIC COLUMN DISCOVERY (The LCRP Discovery)
+        # We find the 'Power' of each input channel from the Hessian
+        column_power = torch.diag(H).abs()
+        # Find the 95th percentile (The Top 5% of columns are 'Logic Columns')
+        logic_threshold = torch.quantile(column_power, 0.95)
+        # Create a shield: 1.0 for Logic Columns, 0.0 for Noise Columns
+        logic_shield = (column_power >= logic_threshold).float().reshape(1, -1)
 
-        # 4. HESSIAN PREPARATION (High-Flexibility Damping)
-        # 0.05 (5%) allows the model to 'heal' better in logic layers
-        damp = percdamp * torch.mean(diag_h)
+        # 3. RESONANCE SCORING (Column-Aware Importance)
+        # Importance = |Weight| * sqrt(Column Power)
+        # This is similar to Wanda, but we add the Logic Shield.
+        importance_scores = torch.abs(W) * torch.sqrt(column_power + 1e-9).reshape(1, -1)
+        
+        # WE PROTECT LOGIC COLUMNS: Give them infinite importance so they are never pruned
+        importance_scores = importance_scores + (logic_shield * 1e9)
+
+        # 4. GLOBAL MASK SELECTION
+        # We pick the top survivors. Because of the shield, Logic Columns stay alive.
+        thresh = torch.sort(importance_scores.flatten())[0][int(importance_scores.numel() * sparsity)]
+        global_mask = importance_scores > thresh
+        
+        del importance_scores, logic_shield
+
+        # 5. SAFE HESSIAN SURGERY (Optimal Brain Surgeon Loop)
+        # We use the standard loop because it is the only way to re-scale the Survivors
+        damp = percdamp * torch.mean(column_power)
         diag = torch.arange(self.columns, device=dev)
         H[diag, diag] += damp
         Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
         Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
 
-        # 5. SURGERY LOOP (Safe OBS)
         W[:, torch.diag(self.H) == 0] = 0
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
@@ -323,7 +321,7 @@ class SparseGPT_OPT:
         if isinstance(self.layer, transformers.Conv1D): W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
         
-        print(f"  GSDP Pruning Done. Logical Manifold Intact.")
+        print(f"  LCRP Pruning Done. Logic Columns Shielded.")
         
     def free(self):
         if DEBUG:
