@@ -123,9 +123,8 @@ def opt_sparsellm(model, dataloader, dev, args):
                   
                     # # Use my new TAP invention
                     # gpts[name].topological_vacuum_pruner(args.sparsity, n_vac=args.n_vac)
-                    # Use the new CHIB invention
-                    num_heads = model.config.num_attention_heads
-                    gpts[name].hcv_chib_fastpruner(args.sparsity, num_heads=num_heads)
+                    # Use my new AOS Outlier Shield invention
+                    gpts[name].hcv_sos_fastpruner(args.sparsity)
                 #     gpts[name].fasterprune_vacuum(
                 #     args.sparsity,
                 #     prunen=args.prunen,
