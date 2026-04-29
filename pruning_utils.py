@@ -250,13 +250,13 @@ class SparseGPT_OPT:
         print(f"Champion Vacuum Pruning (n={n_vac}) Done.")
     
         
-    def hcv_chib_fastpruner(
-        self, sparsity, num_heads, prunen=0, prunem=0, blocksize=128, percdamp=.01
+    def hcv_sos_fastpruner(
+        self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01
     ):
         """
-        NEW INVENTION: Cross-Head Information Bottleneck (CHIB).
-        Identifies 'Broadcaster' columns that carry unique cross-head logic.
-        Uses CHIB to pick the mask and SparseGPT to fix the values.
+        NEW INVENTION: Attentional-Outlier Shielding (AOS).
+        Identifies 'Sovereign Dimensions' in the input manifold and shields them.
+        Uses industry-standard Hessian surgery for the background noise.
         """
         import torch
         import time
@@ -264,50 +264,43 @@ class SparseGPT_OPT:
         # 1. SETUP
         W = self.layer.weight.data.clone().float()
         H = self.H.float()
-        n_rows, n_cols = W.shape
-        head_dim = n_rows // num_heads
         dev = self.dev
         tick = time.time()
 
-        # 2. BROADCAST UTILITY DISCOVERY (The CHIB Invention)
-        # Power of each input feature
-        d_diag = torch.diag(H).abs()
-        # Crosstalk = sum of absolute correlations per column
-        # This identifies which inputs are 'unique' vs 'redundant'
-        crosstalk = torch.sum(torch.abs(H), dim=1)
-        # Utility: High Power / High Crosstalk ratio
-        utility = d_diag / (crosstalk + 1e-9)
-        utility = utility.reshape((1, -1)) # Broadcaster score
-
-        # 3. CHIB SIGNAL SCORING
-        # Signal = |W| * sqrt(H) * Utility
-        # This protects unique information highways
-        signal_scores = torch.abs(W) * torch.sqrt(d_diag + 1e-9).reshape(1, -1) * utility
-
-        # 4. HEAD-NORMALIZATION
-        # Normalize scores within each head to ensure logical balance
-        normalized_scores = torch.zeros_like(signal_scores)
-        for h in range(num_heads):
-            idx = slice(h*head_dim, (h+1)*head_dim)
-            head_score = signal_scores[idx, :]
-            normalized_scores[idx, :] = head_score / (head_score.mean() + 1e-9)
-
-        # 5. MASK SELECTION
-        thresh = torch.sort(normalized_scores.flatten())[0][int(normalized_scores.numel() * sparsity)]
-        global_mask = normalized_scores > thresh
+        # 2. DISCOVER SOVEREIGN DIMENSIONS (The AOS Invention)
+        # We look at the 'Power' of each input feature (Diagonal of H)
+        column_power = torch.diag(H).abs()
         
-        del signal_scores, normalized_scores, utility, crosstalk
-
-        # 6. HESSIAN SURGERY (The 'Healing' Step)
-        # We use the industry-standard loop because it is the only way to hit 117 PPL.
-        damp = percdamp * torch.mean(d_diag)
+        # We identify the top 2% of features as 'Sovereign' (The Outliers)
+        # These features carry the core logic of the Transformer.
+        outlier_thresh = torch.quantile(column_power, 0.98)
+        sovereign_mask = (column_power >= outlier_thresh).float().reshape(1, -1)
+        
+        # 3. CALCULATE MASK WITH PROTECTED CHANNELS
+        # Base metric: Standard Hessian Importance (w^2 / Hinv)
+        damp = percdamp * torch.mean(column_power)
         diag = torch.arange(self.columns, device=dev)
         H[diag, diag] += damp
         Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
-        Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
-        del H, d_diag
+        h_inv_diag = torch.diag(Hinv).reshape((1, -1))
+        
+        importance_scores = W**2 / (h_inv_diag + 1e-9)
+        
+        # APPLY THE SHIELD: Give Sovereign weights 'Infinite Importance'
+        # This ensures they are NEVER pruned, protecting the model's logic.
+        importance_scores = importance_scores + (sovereign_mask * 1e12)
 
+        # 4. GLOBAL MASK SELECTION
+        thresh = torch.sort(importance_scores.flatten())[0][int(importance_scores.numel() * sparsity)]
+        global_mask = importance_scores > thresh
+        
+        del importance_scores, sovereign_mask
+
+        # 5. HESSIAN SURGERY (Optimal Brain Surgeon Loop)
+        # We MUST use this loop to fix the survivors, or PPL will stay high.
         W[:, torch.diag(self.H) == 0] = 0
+        Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
+
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
@@ -318,17 +311,20 @@ class SparseGPT_OPT:
                 w = W1[:, i]; d = Hinv1[i, i]
                 q = w.clone(); q[mask1[:, i]] = 0 
                 
+                # The Correction Math (OBS)
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 W[:, i1+i] = q
 
+            # Push error to remaining columns
             W[:, i2:] -= (W[:, i1:i2] - W1) @ Hinv_cholesky[i1:i2, i2:]
             torch.cuda.empty_cache()
 
-        # 7. CONVERT BACK
+        # 6. CONVERT BACK
         if isinstance(self.layer, transformers.Conv1D): W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        print(f"  CHIB Pruning Done. Information Bottlenecks protected.")
+        
+        print(f"  AOS Pruning Done. Logic Outliers shielded from pruning.")
         
     def free(self):
         if DEBUG:
