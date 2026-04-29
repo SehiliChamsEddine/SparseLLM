@@ -250,62 +250,62 @@ class SparseGPT_OPT:
         print(f"Champion Vacuum Pruning (n={n_vac}) Done.")
     
         
-    def hcv_ascp_fastpruner(
+    def hcv_scp_fastpruner(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01
     ):
         """
-        NEW INVENTION: Adaptive-Stiffness Covariance Pruning (ASCP).
-        Uses Information Entropy to set per-channel damping.
-        This prevents numerical explosions and protects the core logic.
+        NEW INVENTION: Sovereign-Channel Pruning (SCP).
+        Prunes by identifying and 'muting' low-signal input channels.
+        Protects the high-signal 'Sovereign Channels' to maintain logic.
         """
         import torch
         import time
 
-        # 1. SETUP (Force Float64 for the Inversion to be 100% safe)
+        # 1. SETUP
         W = self.layer.weight.data.clone().float()
         H = self.H.float()
         dev = self.dev
         tick = time.time()
 
-        # 2. DISCOVER CHANNEL STIFFNESS (The ASCP Invention)
-        d_diag = torch.diag(H).abs()
-        # Relative Power (Entropy)
-        entropy = d_diag / (d_diag.mean() + 1e-9)
-        # Dynamic Damping: Powerful channels get more protection
-        # This is the 'Stiffness' that prevents PPL explosions
-        stiffness = percdamp * (1.0 + torch.log1p(entropy))
+        # 2. DISCOVER MUTE CHANNELS (The SCP Invention)
+        # Power of each input channel from the Hessian diagonal
+        channel_power = torch.diag(H).abs()
+        # We find the threshold to 'Mute' the bottom percentage of channels
+        # If we want 70% sparsity, we mute the 70% weakest channels
+        mute_thresh = torch.quantile(channel_power, sparsity)
+        # 1.0 for Sovereign (keep), 0.0 for Mute (kill)
+        channel_mask = (channel_power > mute_thresh).float().reshape(1, -1)
 
-        # 3. STABLE RANKING (The Wanda Metric)
-        # Importance = Weight Magnitude * Signal Magnitude
-        # This is the most stable mask-selection metric for Attention
-        importance_scores = torch.abs(W) * torch.sqrt(d_diag + 1e-9).reshape(1, -1)
-        
-        thresh = torch.sort(importance_scores.flatten())[0][int(importance_scores.numel() * sparsity)]
-        global_mask = importance_scores > thresh
-        del importance_scores
-
-        # 4. HESSIAN SURGERY WITH ADAPTIVE DAMPING
-        # Apply the unique stiffness to every diagonal element
-        diag_idx = torch.arange(self.columns, device=dev)
-        H[diag_idx, diag_idx] += stiffness
-        
-        # Safe Inversion
+        # 3. HESSIAN PREPARATION (The Safety Foundation)
+        damp = percdamp * torch.mean(channel_power)
+        diag = torch.arange(self.columns, device=dev)
+        H[diag, diag] += damp
         Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
-        Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
-        del H, stiffness, entropy
+        
+        # 4. STRUCTURAL MASK SELECTION
+        # Every weight attached to a 'Mute' channel is set to 0.
+        # Every weight attached to a 'Sovereign' channel is kept.
+        global_mask = (channel_mask > 0).expand_as(W)
+        
+        del channel_mask, channel_power
 
-        # 5. EXECUTION LOOP
+        # 5. HESSIAN SURGERY (Optimal Brain Surgeon)
+        # Because we used a structural mask, the surgery will be 
+        # extremely effective at moving signal to the Sovereign channels.
         W[:, torch.diag(self.H) == 0] = 0
+        Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
+
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
             W1 = W[:, i1:i2].clone(); Hinv1 = Hinv[i1:i2, i1:i2]
-            mask1 = ~global_mask[:, i1:i2] 
+            mask1 = ~global_mask[:, i1:i2] # Weights to kill
 
             for i in range(count):
                 w = W1[:, i]; d = Hinv1[i, i]
                 q = w.clone(); q[mask1[:, i]] = 0 
                 
+                # The OBS Correction
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 W[:, i1+i] = q
@@ -316,7 +316,8 @@ class SparseGPT_OPT:
         # 6. CONVERT BACK
         if isinstance(self.layer, transformers.Conv1D): W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        print(f"  ASCP Pruning Done. Numerical Stability Guaranteed.")
+        
+        print(f"  SCP Pruning Done. {sparsity*100}% of channels muted.")
         
     def free(self):
         if DEBUG:
