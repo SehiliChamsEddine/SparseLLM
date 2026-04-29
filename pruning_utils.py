@@ -250,13 +250,13 @@ class SparseGPT_OPT:
         print(f"Champion Vacuum Pruning (n={n_vac}) Done.")
     
         
-    def hcv_sos_fastpruner(
+    def hcv_mirf_fastpruner(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01
     ):
         """
-        NEW INVENTION: Attentional-Outlier Shielding (AOS).
-        Identifies 'Sovereign Dimensions' in the input manifold and shields them.
-        Uses industry-standard Hessian surgery for the background noise.
+        NEW INVENTION: Mutual-Information Redundancy Filtering (MIRF).
+        Uses the off-diagonal Hessian to identify and prune 'Copycat' features.
+        Protects 'Unique' information paths to beat the 117 PPL record.
         """
         import torch
         import time
@@ -267,37 +267,46 @@ class SparseGPT_OPT:
         dev = self.dev
         tick = time.time()
 
-        # 2. DISCOVER SOVEREIGN DIMENSIONS (The AOS Invention)
-        # We look at the 'Power' of each input feature (Diagonal of H)
-        column_power = torch.diag(H).abs()
+        # 2. DISCOVER REDUNDANT FEATURES (The MIRF Invention)
+        # H is X @ X.T. We convert it to a Correlation Matrix.
+        d = torch.diag(H).abs()
+        # Correlation C_ij = H_ij / sqrt(H_ii * H_jj)
+        # This identifies features that carry the same information
+        d_inv_sqrt = 1.0 / torch.sqrt(d + 1e-9)
+        # We do this chunked to stay memory-safe for larger models
+        redundancy_penalty = torch.zeros_like(d)
+        for i in range(0, self.columns, 512):
+            end = min(i + 512, self.columns)
+            # Calculate correlation for this chunk vs all features
+            corr_chunk = torch.abs(H[i:end, :]) * d_inv_sqrt[i:end].unsqueeze(1) * d_inv_sqrt.unsqueeze(0)
+            # Sum of correlations = Redundancy Level
+            redundancy_penalty[i:end] = torch.sum(corr_chunk, dim=1)
+            del corr_chunk
+
+        # Normalize penalty (1.0 = Unique, higher = Redundant)
+        # We use a log-scale to keep the nudge subtle but effective
+        mirf_nudge = 1.0 / torch.log1p(redundancy_penalty + 1.0)
+        mirf_nudge = (mirf_nudge / mirf_nudge.max()).reshape((1, -1))
         
-        # We identify the top 2% of features as 'Sovereign' (The Outliers)
-        # These features carry the core logic of the Transformer.
-        outlier_thresh = torch.quantile(column_power, 0.98)
-        sovereign_mask = (column_power >= outlier_thresh).float().reshape(1, -1)
-        
-        # 3. CALCULATE MASK WITH PROTECTED CHANNELS
-        # Base metric: Standard Hessian Importance (w^2 / Hinv)
-        damp = percdamp * torch.mean(column_power)
+        # 3. CALCULATE MASK (Hessian + MIRF Intelligence)
+        # Base: Standard Hessian sensitivity (w^2 / Hinv)
+        damp = percdamp * torch.mean(d)
         diag = torch.arange(self.columns, device=dev)
         H[diag, diag] += damp
         Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
         h_inv_diag = torch.diag(Hinv).reshape((1, -1))
         
-        importance_scores = W**2 / (h_inv_diag + 1e-9)
+        # Combined Score: Standard SparseGPT * Information Uniqueness
+        # This forces the model to keep 'Unique' signals and kill 'Copycats'
+        importance_scores = (W**2 / (h_inv_diag + 1e-9)) * mirf_nudge
         
-        # APPLY THE SHIELD: Give Sovereign weights 'Infinite Importance'
-        # This ensures they are NEVER pruned, protecting the model's logic.
-        importance_scores = importance_scores + (sovereign_mask * 1e12)
-
-        # 4. GLOBAL MASK SELECTION
         thresh = torch.sort(importance_scores.flatten())[0][int(importance_scores.numel() * sparsity)]
         global_mask = importance_scores > thresh
         
-        del importance_scores, sovereign_mask
+        del importance_scores, mirf_nudge, redundancy_penalty
 
-        # 5. HESSIAN SURGERY (Optimal Brain Surgeon Loop)
-        # We MUST use this loop to fix the survivors, or PPL will stay high.
+        # 4. HESSIAN SURGERY (Safe Correction)
+        # We MUST use the original loop to maintain the 127 PPL baseline
         W[:, torch.diag(self.H) == 0] = 0
         Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
 
@@ -311,20 +320,18 @@ class SparseGPT_OPT:
                 w = W1[:, i]; d = Hinv1[i, i]
                 q = w.clone(); q[mask1[:, i]] = 0 
                 
-                # The Correction Math (OBS)
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 W[:, i1+i] = q
 
-            # Push error to remaining columns
             W[:, i2:] -= (W[:, i1:i2] - W1) @ Hinv_cholesky[i1:i2, i2:]
             torch.cuda.empty_cache()
 
-        # 6. CONVERT BACK
+        # 5. CONVERT BACK
         if isinstance(self.layer, transformers.Conv1D): W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
         
-        print(f"  AOS Pruning Done. Logic Outliers shielded from pruning.")
+        print(f"  MIRF Pruning Done. Cross-feature redundancy suppressed.")
         
     def free(self):
         if DEBUG:
