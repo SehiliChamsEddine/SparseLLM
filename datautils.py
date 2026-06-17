@@ -28,8 +28,8 @@ def get_tokenizer(model):
 
 def get_wikitext2(nsamples, seed, seqlen, model, tokenizer):
     
-    traindata = load_dataset('datasets/wikitext', 'wikitext-2-raw-v1', split='train')
-    testdata = load_dataset('datasets/wikitext', 'wikitext-2-raw-v1', split='test')
+    traindata = load_dataset('Salesforce/wikitext', 'wikitext-2-raw-v1', split='train')
+    testdata = load_dataset('Salesforce/wikitext', 'wikitext-2-raw-v1', split='test')
 
     trainenc = tokenizer(" ".join(traindata['text']), return_tensors='pt')
     testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
