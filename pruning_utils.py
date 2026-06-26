@@ -66,106 +66,6 @@ class SparseGPT_OPT:
         inp = math.sqrt(2 / self.nsamples) * inp.float()
         self.H += inp.matmul(inp.t())
 
-    # def fasterprune(
-    #     self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01
-    # ):
-    #     W = self.layer.weight.data.clone()
-    #     if isinstance(self.layer, nn.Conv2d):
-    #         W = W.flatten(1)
-    #     if isinstance(self.layer, transformers.Conv1D):
-    #         W = W.t()
-    #     W = W.float()
-
-    #     if hasattr(self, 'quantizer'):
-    #         if not self.quantizer.ready():
-    #             self.quantizer.find_params(W, weight=True)
-
-    #     tick = time.time()
-
-    #     H = self.H
-    #     # del self.H 
-    #     dead = torch.diag(H) == 0
-    #     H[dead, dead] = 1
-    #     W[:, dead] = 0
-
-    #     Losses = torch.zeros(self.rows, device=self.dev)
-
-    #     damp = percdamp * torch.mean(torch.diag(H))
-    #     diag = torch.arange(self.columns, device=self.dev)
-    #     H[diag, diag] += damp
-    #     H = torch.linalg.cholesky(H)
-    #     H = torch.cholesky_inverse(H)
-    #     H = torch.linalg.cholesky(H, upper=True)
-    #     Hinv = H
-
-    #     mask = None
-
-    #     for i1 in range(0, self.columns, blocksize):
-    #         i2 = min(i1 + blocksize, self.columns)
-    #         count = i2 - i1
-
-    #         W1 = W[:, i1:i2].clone()
-    #         Q1 = torch.zeros_like(W1)
-    #         Err1 = torch.zeros_like(W1)
-    #         Losses1 = torch.zeros_like(W1)
-    #         Hinv1 = Hinv[i1:i2, i1:i2]
-
-    #         if prunen == 0: 
-    #             if mask is not None:
-    #                 mask1 = mask[:, i1:i2]
-    #             else:
-    #                 tmp = W1 ** 2 / (torch.diag(Hinv1).reshape((1, -1))) ** 2
-    #                 thresh = torch.sort(tmp.flatten())[0][int(tmp.numel() * sparsity)]
-    #                 mask1 = tmp <= thresh
-    #         else:
-    #             mask1 = torch.zeros_like(W1) == 1
-
-    #         for i in range(count):
-    #             w = W1[:, i]
-    #             d = Hinv1[i, i]
-
-    #             if prunen != 0 and i % prunem == 0:
-    #                 tmp = W1[:, i:(i + prunem)] ** 2 / (torch.diag(Hinv1)[i:(i + prunem)].reshape((1, -1))) ** 2
-    #                 mask1.scatter_(1, i + torch.topk(tmp, prunen, dim=1, largest=False)[1], True)
-
-    #             q = w.clone()
-    #             q[mask1[:, i]] = 0
-
-    #             if hasattr(self, 'quantizer'):
-    #                 q = quantize(
-    #                     q.unsqueeze(1), self.quantizer.scale, self.quantizer.zero, self.quantizer.maxq
-    #                 ).flatten()
-
-    #             Q1[:, i] = q
-    #             Losses1[:, i] = (w - q) ** 2 / d ** 2
-
-    #             err1 = (w - q) / d
-    #             W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-    #             Err1[:, i] = err1
-
-    #         W[:, i1:i2] = Q1
-    #         Losses += torch.sum(Losses1, 1) / 2
-
-    #         W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
-
-    #         # if DEBUG:
-    #         #     self.layer.weight.data[:, :i2] = W[:, :i2]
-    #         #     self.layer.weight.data[:, i2:] = W[:, i2:]
-    #         #     print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
-    #         #     print(torch.sum(Losses))
-
-    #     torch.cuda.synchronize()
-    #     print('time %.2f' % (time.time() - tick))
-    #     print('error', torch.sum(Losses).item())
-
-    #     if isinstance(self.layer, transformers.Conv1D):
-    #         W = W.t()
-    #     self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        # if DEBUG:
-            # print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
-
-
-# -----------------------------------  2:4 sparsity
     def fasterprune(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01
     ):
@@ -181,12 +81,15 @@ class SparseGPT_OPT:
                 self.quantizer.find_params(W, weight=True)
 
         tick = time.time()
+
         H = self.H
+        # del self.H 
         dead = torch.diag(H) == 0
         H[dead, dead] = 1
         W[:, dead] = 0
 
         Losses = torch.zeros(self.rows, device=self.dev)
+
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
@@ -194,6 +97,8 @@ class SparseGPT_OPT:
         H = torch.cholesky_inverse(H)
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
+
+        mask = None
 
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
@@ -205,26 +110,23 @@ class SparseGPT_OPT:
             Losses1 = torch.zeros_like(W1)
             Hinv1 = Hinv[i1:i2, i1:i2]
 
-            # --- HARD-CODED 2:4 MASK SELECTION ---
-            # tmp: [rows, block_columns]
-            tmp = W1 ** 2 / (torch.diag(Hinv1).reshape((1, -1))) ** 2
-            
-            # Reshape into groups of 4 along the columns
-            # New shape: [rows, groups, 4]
-            tmp_reshaped = tmp.view(self.rows, -1, 4)
-            # Find indices of the 2 smallest in each group to prune
-            mask1 = torch.zeros_like(tmp_reshaped, dtype=torch.bool)
-            # topk(k=2, largest=False) gives the 2 items to BE REMOVED
-            prune_indices = torch.topk(tmp_reshaped, 2, dim=2, largest=False)[1]
-            mask1.scatter_(2, prune_indices, True)
-            del prune_indices , tmp_reshaped , tmp
-            # Reshape back to [rows, block_columns]
-            mask1 = mask1.view(self.rows, count)
-            # -------------------------------------
+            if prunen == 0: 
+                if mask is not None:
+                    mask1 = mask[:, i1:i2]
+                else:
+                    tmp = W1 ** 2 / (torch.diag(Hinv1).reshape((1, -1))) ** 2
+                    thresh = torch.sort(tmp.flatten())[0][int(tmp.numel() * sparsity)]
+                    mask1 = tmp <= thresh
+            else:
+                mask1 = torch.zeros_like(W1) == 1
 
             for i in range(count):
                 w = W1[:, i]
                 d = Hinv1[i, i]
+
+                if prunen != 0 and i % prunem == 0:
+                    tmp = W1[:, i:(i + prunem)] ** 2 / (torch.diag(Hinv1)[i:(i + prunem)].reshape((1, -1))) ** 2
+                    mask1.scatter_(1, i + torch.topk(tmp, prunen, dim=1, largest=False)[1], True)
 
                 q = w.clone()
                 q[mask1[:, i]] = 0
@@ -243,7 +145,14 @@ class SparseGPT_OPT:
 
             W[:, i1:i2] = Q1
             Losses += torch.sum(Losses1, 1) / 2
+
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+
+            # if DEBUG:
+            #     self.layer.weight.data[:, :i2] = W[:, :i2]
+            #     self.layer.weight.data[:, i2:] = W[:, i2:]
+            #     print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
+            #     print(torch.sum(Losses))
 
         torch.cuda.synchronize()
         print('time %.2f' % (time.time() - tick))
@@ -252,6 +161,97 @@ class SparseGPT_OPT:
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
+        if DEBUG:
+            print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
+
+
+# -----------------------------------  2:4 sparsity
+    # def fasterprune(
+    #     self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01
+    # ):
+    #     W = self.layer.weight.data.clone()
+    #     if isinstance(self.layer, nn.Conv2d):
+    #         W = W.flatten(1)
+    #     if isinstance(self.layer, transformers.Conv1D):
+    #         W = W.t()
+    #     W = W.float()
+
+    #     if hasattr(self, 'quantizer'):
+    #         if not self.quantizer.ready():
+    #             self.quantizer.find_params(W, weight=True)
+
+    #     tick = time.time()
+    #     H = self.H
+    #     dead = torch.diag(H) == 0
+    #     H[dead, dead] = 1
+    #     W[:, dead] = 0
+
+    #     Losses = torch.zeros(self.rows, device=self.dev)
+    #     damp = percdamp * torch.mean(torch.diag(H))
+    #     diag = torch.arange(self.columns, device=self.dev)
+    #     H[diag, diag] += damp
+    #     H = torch.linalg.cholesky(H)
+    #     H = torch.cholesky_inverse(H)
+    #     H = torch.linalg.cholesky(H, upper=True)
+    #     Hinv = H
+
+    #     for i1 in range(0, self.columns, blocksize):
+    #         i2 = min(i1 + blocksize, self.columns)
+    #         count = i2 - i1
+
+    #         W1 = W[:, i1:i2].clone()
+    #         Q1 = torch.zeros_like(W1)
+    #         Err1 = torch.zeros_like(W1)
+    #         Losses1 = torch.zeros_like(W1)
+    #         Hinv1 = Hinv[i1:i2, i1:i2]
+
+    #         # --- HARD-CODED 2:4 MASK SELECTION ---
+    #         # tmp: [rows, block_columns]
+    #         tmp = W1 ** 2 / (torch.diag(Hinv1).reshape((1, -1))) ** 2
+            
+    #         # Reshape into groups of 4 along the columns
+    #         # New shape: [rows, groups, 4]
+    #         tmp_reshaped = tmp.view(self.rows, -1, 4)
+    #         # Find indices of the 2 smallest in each group to prune
+    #         mask1 = torch.zeros_like(tmp_reshaped, dtype=torch.bool)
+    #         # topk(k=2, largest=False) gives the 2 items to BE REMOVED
+    #         prune_indices = torch.topk(tmp_reshaped, 2, dim=2, largest=False)[1]
+    #         mask1.scatter_(2, prune_indices, True)
+    #         del prune_indices , tmp_reshaped , tmp
+    #         # Reshape back to [rows, block_columns]
+    #         mask1 = mask1.view(self.rows, count)
+    #         # -------------------------------------
+
+    #         for i in range(count):
+    #             w = W1[:, i]
+    #             d = Hinv1[i, i]
+
+    #             q = w.clone()
+    #             q[mask1[:, i]] = 0
+
+    #             if hasattr(self, 'quantizer'):
+    #                 q = quantize(
+    #                     q.unsqueeze(1), self.quantizer.scale, self.quantizer.zero, self.quantizer.maxq
+    #                 ).flatten()
+
+    #             Q1[:, i] = q
+    #             Losses1[:, i] = (w - q) ** 2 / d ** 2
+
+    #             err1 = (w - q) / d
+    #             W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+    #             Err1[:, i] = err1
+
+    #         W[:, i1:i2] = Q1
+    #         Losses += torch.sum(Losses1, 1) / 2
+    #         W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+
+    #     torch.cuda.synchronize()
+    #     print('time %.2f' % (time.time() - tick))
+    #     print('error', torch.sum(Losses).item())
+
+    #     if isinstance(self.layer, transformers.Conv1D):
+    #         W = W.t()
+    #     self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
 
 # ---------------------------------------- 3:4 sparsity 
     # def fasterprune(
@@ -331,136 +331,56 @@ class SparseGPT_OPT:
     #         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
 
 # ----------------------------------- Original  
-    # def fasterprune_vacuum(
-    #     self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
-    #     n_vac=3, lmbda=0, cooking_iters=0, lr_vac=0
-    # ):
-    #     """
-    #     THE CHAMPION VERSION: Aggressive Contrast + Redundancy Mapping.
-    #     This version integrates the n_vac=3 success with Feature Uniqueness.
-    #     """
-    #     # 1. SETUP (Float32 is mandatory for 127-range results)
-    #     W = self.layer.weight.data.clone().float()
-    #     H = self.H.float()
-    #     tick = time.time()
-
-    #     # 2. FEATURE UNIQUENESS (The tie-breaker)
-    #     # We look at the correlation matrix of inputs to find unique features
-    #     d = torch.diag(H)
-    #     # Correlation C_ij = H_ij / sqrt(H_ii * H_jj)
-    #     C = H / (torch.sqrt(torch.outer(d, d)) + 1e-9)
-    #     # uniqueness = 1 / log(total correlation)
-    #     # This rewards weights that are the 'only ones' sending a specific signal
-    #     uniqueness = 1.0 / torch.log1p(torch.sum(torch.abs(C), dim=1) + 1.0)
-
-    #     del C
-    #     uniqueness = (uniqueness / uniqueness.max()).reshape((1, -1))
-    #     # Keep the uniqueness nudge subtle (0.9 to 1.0)
-    #     uniqueness = torch.clamp(uniqueness, min=0.9)
-
-    #     # 3. AGGRESSIVE ROW-WISE VACUUM (Your n_vac=3 discovery)
-    #     row_max = torch.max(torch.abs(W), dim=1, keepdim=True)[0] + 1e-9
-    #     # n_vac=3 creates the w^7 contrast which gave you the 132 PPL
-    #     v_multiplier = torch.pow(torch.abs(W) / row_max, n_vac)
-
-    #     # 4. PREPARE HESSIAN
-    #     damp = percdamp * torch.mean(torch.diag(H))
-    #     diag = torch.arange(self.columns, device=self.dev)
-    #     H[diag, diag] += damp
-    #     Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
-    #     h_inv_diag = torch.diag(Hinv).reshape((1, -1))
-            
-    #     # 5. THE INTEGRATED WINNING SCORE
-    #     # Formula: Standard OBS * Vacuum Contrast * Uniqueness Bonus
-    #     base_score = W**2 / (h_inv_diag + 1e-9)
-    #     importance_scores = base_score * v_multiplier * uniqueness
-    #     del base_score , v_multiplier , uniqueness
-    #     # --- NEW OPTIMIZATION: Convert scores to a small Boolean mask ---
-    #     thresh = torch.sort(importance_scores.flatten())[0][int(importance_scores.numel() * sparsity)]
-    #     global_mask = importance_scores > thresh
-    #     del importance_scores # <--- GIANT SAVINGS: Deletes scores before the loop starts
-        
-    #     # 6. EXACT SparseGPT EXECUTION LOOP
-    #     W[:, torch.diag(H) == 0] = 0
-    #     del H    
-    #     Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
-    #     del Hinv
-    #     for i1 in range(0, self.columns, blocksize):
-    #         i2 = min(i1 + blocksize, self.columns)
-    #         count = i2 - i1
-    #         W1 = W[:, i1:i2].clone()
-    #         Q1 = torch.zeros_like(W1)
-    #         Err1 = torch.zeros_like(W1)
-    #         Hinv1 = Hinv_cholesky[i1:i2, i1:i2]
-            
-    #         # Mask selection using the integrated champion scores
-    #         mask1 = ~global_mask[:, i1:i2] 
-
-    #         for i in range(count):
-    #             w = W1[:, i]; d = Hinv1[i, i]
-    #             q = w.clone()
-    #             q[mask1[:, i]] = 0 
-    #             Q1[:, i] = q
-
-    #             # Numerical correction to fix the error of killed weights
-    #             err1 = (w - q) / d
-    #             W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-    #             Err1[:, i] = err1
-
-    #         W[:, i1:i2] = Q1
-    #         W[:, i2:] -= Err1.matmul(Hinv_cholesky[i1:i2, i2:])
-    #         del W1, Hinv1, mask1
-    #     del Hinv_cholesky, global_mask
-    #     # 7. CONVERT BACK
-    #     if isinstance(self.layer, transformers.Conv1D):
-    #         W = W.t()
-    #     self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-    #     print(f"Champion Vacuum Pruning (n={n_vac}) Done.")
-  
-
-# ------------------------------------------ 2:4 sparsity 
     def fasterprune_vacuum(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
         n_vac=3, lmbda=0, cooking_iters=0, lr_vac=0
     ):
+        """
+        THE CHAMPION VERSION: Aggressive Contrast + Redundancy Mapping.
+        This version integrates the n_vac=3 success with Feature Uniqueness.
+        """
+        # 1. SETUP (Float32 is mandatory for 127-range results)
         W = self.layer.weight.data.clone().float()
         H = self.H.float()
         tick = time.time()
 
+        # 2. FEATURE UNIQUENESS (The tie-breaker)
+        # We look at the correlation matrix of inputs to find unique features
         d = torch.diag(H)
+        # Correlation C_ij = H_ij / sqrt(H_ii * H_jj)
         C = H / (torch.sqrt(torch.outer(d, d)) + 1e-9)
+        # uniqueness = 1 / log(total correlation)
+        # This rewards weights that are the 'only ones' sending a specific signal
         uniqueness = 1.0 / torch.log1p(torch.sum(torch.abs(C), dim=1) + 1.0)
+
         del C
         uniqueness = (uniqueness / uniqueness.max()).reshape((1, -1))
+        # Keep the uniqueness nudge subtle (0.9 to 1.0)
         uniqueness = torch.clamp(uniqueness, min=0.9)
 
+        # 3. AGGRESSIVE ROW-WISE VACUUM (Your n_vac=3 discovery)
         row_max = torch.max(torch.abs(W), dim=1, keepdim=True)[0] + 1e-9
+        # n_vac=3 creates the w^7 contrast which gave you the 132 PPL
         v_multiplier = torch.pow(torch.abs(W) / row_max, n_vac)
 
+        # 4. PREPARE HESSIAN
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
         Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
         h_inv_diag = torch.diag(Hinv).reshape((1, -1))
             
+        # 5. THE INTEGRATED WINNING SCORE
+        # Formula: Standard OBS * Vacuum Contrast * Uniqueness Bonus
         base_score = W**2 / (h_inv_diag + 1e-9)
         importance_scores = base_score * v_multiplier * uniqueness
         del base_score , v_multiplier , uniqueness
-
-        # --- HARD-CODED 2:4 GLOBAL MASK ---
-        # Reshape to [rows, groups_of_4, 4]
-        scores_reshaped = importance_scores.view(self.rows, -1, 4)
-        # We want to KEEP the top 2 in each group
-        top2_indices = torch.topk(scores_reshaped, 2, dim=2, largest=True)[1]
+        # --- NEW OPTIMIZATION: Convert scores to a small Boolean mask ---
+        thresh = torch.sort(importance_scores.flatten())[0][int(importance_scores.numel() * sparsity)]
+        global_mask = importance_scores > thresh
+        del importance_scores # <--- GIANT SAVINGS: Deletes scores before the loop starts
         
-        # Build global mask (True = Keep)
-        global_mask = torch.zeros_like(scores_reshaped, dtype=torch.bool)
-        global_mask.scatter_(2, top2_indices, True)
-        global_mask = global_mask.view(self.rows, self.columns)
-        
-        del importance_scores , scores_reshaped
-        # ----------------------------------
-        
+        # 6. EXACT SparseGPT EXECUTION LOOP
         W[:, torch.diag(H) == 0] = 0
         del H    
         Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
@@ -473,7 +393,7 @@ class SparseGPT_OPT:
             Err1 = torch.zeros_like(W1)
             Hinv1 = Hinv_cholesky[i1:i2, i1:i2]
             
-            # Mask selection (mask1=True for weights TO BE PRUNED)
+            # Mask selection using the integrated champion scores
             mask1 = ~global_mask[:, i1:i2] 
 
             for i in range(count):
@@ -482,6 +402,7 @@ class SparseGPT_OPT:
                 q[mask1[:, i]] = 0 
                 Q1[:, i] = q
 
+                # Numerical correction to fix the error of killed weights
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 Err1[:, i] = err1
@@ -490,11 +411,90 @@ class SparseGPT_OPT:
             W[:, i2:] -= Err1.matmul(Hinv_cholesky[i1:i2, i2:])
             del W1, Hinv1, mask1
         del Hinv_cholesky, global_mask
-
+        # 7. CONVERT BACK
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
         self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        print(f"Champion Vacuum 2:4 Pruning Done.")
+        print(f"Champion Vacuum Pruning (n={n_vac}) Done.")
+  
+
+# ------------------------------------------ 2:4 sparsity 
+    # def fasterprune_vacuum(
+    #     self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01,
+    #     n_vac=3, lmbda=0, cooking_iters=0, lr_vac=0
+    # ):
+    #     W = self.layer.weight.data.clone().float()
+    #     H = self.H.float()
+    #     tick = time.time()
+
+    #     d = torch.diag(H)
+    #     C = H / (torch.sqrt(torch.outer(d, d)) + 1e-9)
+    #     uniqueness = 1.0 / torch.log1p(torch.sum(torch.abs(C), dim=1) + 1.0)
+    #     del C
+    #     uniqueness = (uniqueness / uniqueness.max()).reshape((1, -1))
+    #     uniqueness = torch.clamp(uniqueness, min=0.9)
+
+    #     row_max = torch.max(torch.abs(W), dim=1, keepdim=True)[0] + 1e-9
+    #     v_multiplier = torch.pow(torch.abs(W) / row_max, n_vac)
+
+    #     damp = percdamp * torch.mean(torch.diag(H))
+    #     diag = torch.arange(self.columns, device=self.dev)
+    #     H[diag, diag] += damp
+    #     Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
+    #     h_inv_diag = torch.diag(Hinv).reshape((1, -1))
+            
+    #     base_score = W**2 / (h_inv_diag + 1e-9)
+    #     importance_scores = base_score * v_multiplier * uniqueness
+    #     del base_score , v_multiplier , uniqueness
+
+    #     # --- HARD-CODED 2:4 GLOBAL MASK ---
+    #     # Reshape to [rows, groups_of_4, 4]
+    #     scores_reshaped = importance_scores.view(self.rows, -1, 4)
+    #     # We want to KEEP the top 2 in each group
+    #     top2_indices = torch.topk(scores_reshaped, 2, dim=2, largest=True)[1]
+        
+    #     # Build global mask (True = Keep)
+    #     global_mask = torch.zeros_like(scores_reshaped, dtype=torch.bool)
+    #     global_mask.scatter_(2, top2_indices, True)
+    #     global_mask = global_mask.view(self.rows, self.columns)
+        
+    #     del importance_scores , scores_reshaped
+    #     # ----------------------------------
+        
+    #     W[:, torch.diag(H) == 0] = 0
+    #     del H    
+    #     Hinv_cholesky = torch.linalg.cholesky(Hinv, upper=True)
+    #     del Hinv
+    #     for i1 in range(0, self.columns, blocksize):
+    #         i2 = min(i1 + blocksize, self.columns)
+    #         count = i2 - i1
+    #         W1 = W[:, i1:i2].clone()
+    #         Q1 = torch.zeros_like(W1)
+    #         Err1 = torch.zeros_like(W1)
+    #         Hinv1 = Hinv_cholesky[i1:i2, i1:i2]
+            
+    #         # Mask selection (mask1=True for weights TO BE PRUNED)
+    #         mask1 = ~global_mask[:, i1:i2] 
+
+    #         for i in range(count):
+    #             w = W1[:, i]; d = Hinv1[i, i]
+    #             q = w.clone()
+    #             q[mask1[:, i]] = 0 
+    #             Q1[:, i] = q
+
+    #             err1 = (w - q) / d
+    #             W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+    #             Err1[:, i] = err1
+
+    #         W[:, i1:i2] = Q1
+    #         W[:, i2:] -= Err1.matmul(Hinv_cholesky[i1:i2, i2:])
+    #         del W1, Hinv1, mask1
+    #     del Hinv_cholesky, global_mask
+
+    #     if isinstance(self.layer, transformers.Conv1D):
+    #         W = W.t()
+    #     self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
+    #     print(f"Champion Vacuum 2:4 Pruning Done.")
 
 # --------------------------------------- 3:4 sparsity 
     # def fasterprune_vacuum(
