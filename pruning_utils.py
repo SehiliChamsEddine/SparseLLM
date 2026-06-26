@@ -217,6 +217,7 @@ class SparseGPT_OPT:
             # topk(k=2, largest=False) gives the 2 items to BE REMOVED
             prune_indices = torch.topk(tmp_reshaped, 2, dim=2, largest=False)[1]
             mask1.scatter_(2, prune_indices, True)
+            del prune_indices , tmp_reshaped , tmp
             # Reshape back to [rows, block_columns]
             mask1 = mask1.view(self.rows, count)
             # -------------------------------------
@@ -457,7 +458,7 @@ class SparseGPT_OPT:
         global_mask.scatter_(2, top2_indices, True)
         global_mask = global_mask.view(self.rows, self.columns)
         
-        del importance_scores
+        del importance_scores , scores_reshaped
         # ----------------------------------
         
         W[:, torch.diag(H) == 0] = 0
