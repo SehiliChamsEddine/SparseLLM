@@ -214,6 +214,9 @@ def opt_sparsellm(model, dataloader, dev, args):
         
         # 4. Invert using Cholesky (Most stable for A100)
         # We use try/except as a final safety layer for giant models
+        # 5. Calculate Pseudo-inverse: Xinv = X.T @ H_inv
+        # We need Xinv to be (Samples x Features) to multiply with (Neurons x Samples)
+       
         try:
             L = torch.linalg.cholesky(H)
             H_inv = torch.cholesky_inverse(L)
@@ -223,8 +226,15 @@ def opt_sparsellm(model, dataloader, dev, args):
         
         # 5. Calculate Pseudo-inverse: Xinv = H_inv @ X.T
         # We perform this in float32 for accuracy, then cast to half
-        X_f32_T = X.to(dtype=torch.float32).T
-        Xinv = torch.matmul(H_inv, X_f32_T).half()
+        X_f32 = X.to(dtype=torch.float32)
+        # If X is (Features x Samples), we need the Transpose first
+        if X_f32.shape[0] < X_f32.shape[1]:
+            # X is [768, 131072], so X.T is [131072, 768]
+            # Correct order: [131072, 768] @ [768, 768] = [131072, 768]
+            Xinv = torch.matmul(X_f32.T, H_inv).half()
+        else:
+            # This handles the case if X was not transposed earlier
+            Xinv = torch.matmul(X_f32, H_inv).half()
         
         # 6. Cleanup
         del H, H_inv, diag, L, X_f32_T
