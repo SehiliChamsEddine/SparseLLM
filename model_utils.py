@@ -197,28 +197,28 @@ def opt_sparsellm(model, dataloader, dev, args):
 
         torch.cuda.empty_cache()
 
-                # --- CLEAN SCALE A100 FIX ---
+        #         # --- CLEAN SCALE A100 FIX ---
         
-        # 1. Use the RAW activations X (convert to float32 for math)
-        X_f32 = X.to(dtype=torch.float32)
+        # # 1. Use the RAW activations X (convert to float32 for math)
+        # X_f32 = X.to(dtype=torch.float32)
         
-        # 2. Calculate a CLEAN Hessian (not the one from gpts object!)
-        # This ensures the scale is exactly 1:1 with your activations
-        H_clean = torch.matmul(X_f32.T, X_f32)
+        # # 2. Calculate a CLEAN Hessian (not the one from gpts object!)
+        # # This ensures the scale is exactly 1:1 with your activations
+        # H_clean = torch.matmul(X_f32.T, X_f32)
         
-        # 3. Add a tiny epsilon for inversion stability (matches pinverse behavior)
-        eps = 1e-9
-        H_inv = torch.inverse(H_clean + eps * torch.eye(H_clean.shape[0], device=H_clean.device))
+        # # 3. Add a tiny epsilon for inversion stability (matches pinverse behavior)
+        # eps = 1e-9
+        # H_inv = torch.inverse(H_clean + eps * torch.eye(H_clean.shape[0], device=H_clean.device))
         
-        # 4. Calculate Xinv = X @ (X^T @ X)^-1
-        # Order: [Samples x Features] @ [Features x Features] = [Samples x Features]
-        Xinv = torch.matmul(X_f32, H_inv).half()
+        # # 4. Calculate Xinv = X @ (X^T @ X)^-1
+        # # Order: [Samples x Features] @ [Features x Features] = [Samples x Features]
+        # Xinv = torch.matmul(X_f32, H_inv).half()
         
         # 5. Important: Free the clean Hessian immediately
-        del X_f32, H_clean, H_inv
-        torch.cuda.empty_cache()
+        # del X_f32, H_clean, H_inv
+        # torch.cuda.empty_cache()
         # Pre-compute the pinverse of X and cache it to save computational cost
-        # Xinv = torch.pinverse(X.to(dtype=torch.float32)).half()
+        Xinv = torch.pinverse(X.to(dtype=torch.float32)).half()
 
         for opt_step in range(opt_epochs):
 
