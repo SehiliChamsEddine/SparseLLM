@@ -237,7 +237,7 @@ def opt_sparsellm(model, dataloader, dev, args):
             Xinv = torch.matmul(X_f32, H_inv).half()
         
         # 6. Cleanup
-        del H, H_inv, diag, L, X_f32_T
+        del H, H_inv, diag, L, X_f32
         torch.cuda.empty_cache()
         # Pre-compute the pinverse of X and cache it to save computational cost
         # Xinv = torch.pinverse(X.to(dtype=torch.float32)).half()
