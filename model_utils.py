@@ -637,13 +637,38 @@ def llama_sparsellm(model, dataloader, dev, args):
                     print(i, name)
                     print('Pruning ...')
                     sparsity = args.sparsity
-                    gpts[name].fasterprune(
-                        sparsity,
+                    # CONDITIONAL LOGIC TO SWITCH BETWEEN PRUNING METHODS
+                    if args.use_vacuum and name in ['fc1', 'fc2']:
+                        print('Pruning with VACUUM ...')
+                        gpts[name].fasterprune_vacuum(
+                        args.sparsity,
                         prunen=args.prunen,
                         prunem=args.prunem,
-                        percdamp=args.percdamp,
                         blocksize=args.blocksize,
-                    )
+                        percdamp=args.percdamp,
+                        n_vac=args.n_vac,
+                        lmbda=args.lmbda_vac,   # Passes as 'lmbda'
+                        cooking_iters=args.cooking_iters,
+                        lr_vac=args.lr_vac      # Passes as 'lr_vac'
+                                            )
+                    else:
+                        print('Pruning with SparseGPT ...')
+                        gpts[name].fasterprune(
+                            args.sparsity, 
+                            prunen=args.prunen, 
+                            prunem=args.prunem, 
+                            percdamp=args.percdamp, 
+                            blocksize=args.blocksize
+                        )
+
+                    
+                    # gpts[name].fasterprune(
+                    #     sparsity,
+                    #     prunen=args.prunen,
+                    #     prunem=args.prunem,
+                    #     percdamp=args.percdamp,
+                    #     blocksize=args.blocksize,
+                    # )
 
                 ##############
                 # optimize p
