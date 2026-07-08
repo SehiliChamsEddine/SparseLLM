@@ -197,8 +197,40 @@ def opt_sparsellm(model, dataloader, dev, args):
 
         torch.cuda.empty_cache()
 
+        # --- FINAL OPTIMIZED Xinv CALCULATION ---
+
+        # 1. Pull the Hessian directly from the SparseGPT object
+        H = gpts['fc1'].H.to(dtype=torch.float32)
+        
+        # 2. Dead Neuron Protection (Numerical Safety)
+        # If a diagonal is 0, the feature is dead. We set it to 1 to allow inversion.
+        dead = torch.diag(H) == 0
+        H[dead, dead] = 1
+        
+        # 3. Add Damping (Tikhonov Regularization)
+        damp = args.percdamp * torch.mean(torch.diag(H))
+        diag = torch.arange(H.shape[0], device=H.device)
+        H[diag, diag] += damp
+        
+        # 4. Invert using Cholesky (Most stable for A100)
+        # We use try/except as a final safety layer for giant models
+        try:
+            L = torch.linalg.cholesky(H)
+            H_inv = torch.cholesky_inverse(L)
+        except torch._C._LinAlgError:
+            # Fallback to standard inverse if Cholesky fails due to noise
+            H_inv = torch.inverse(H)
+        
+        # 5. Calculate Pseudo-inverse: Xinv = H_inv @ X.T
+        # We perform this in float32 for accuracy, then cast to half
+        X_f32_T = X.to(dtype=torch.float32).T
+        Xinv = torch.matmul(H_inv, X_f32_T).half()
+        
+        # 6. Cleanup
+        del H, H_inv, diag, L, X_f32_T
+        torch.cuda.empty_cache()
         # Pre-compute the pinverse of X and cache it to save computational cost
-        Xinv = torch.pinverse(X.to(dtype=torch.float32)).half()
+        # Xinv = torch.pinverse(X.to(dtype=torch.float32)).half()
 
         for opt_step in range(opt_epochs):
 
