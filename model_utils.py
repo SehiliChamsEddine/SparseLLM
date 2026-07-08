@@ -200,7 +200,8 @@ def opt_sparsellm(model, dataloader, dev, args):
         # --- FINAL OPTIMIZED Xinv CALCULATION ---
 
         # 1. Pull the Hessian directly from the SparseGPT object
-        H = gpts['fc1'].H.to(dtype=torch.float32)
+        H = gpts['fc1'].H.clone()
+        H = H.to(dtype=torch.float32)
         
         # 2. Dead Neuron Protection (Numerical Safety)
         # If a diagonal is 0, the feature is dead. We set it to 1 to allow inversion.
