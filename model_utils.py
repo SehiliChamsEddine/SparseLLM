@@ -197,48 +197,25 @@ def opt_sparsellm(model, dataloader, dev, args):
 
         torch.cuda.empty_cache()
 
-        # --- FINAL OPTIMIZED Xinv CALCULATION ---
-
-        # 1. Pull the Hessian directly from the SparseGPT object
-        H = gpts['fc1'].H.clone()
-        H = H.to(dtype=torch.float32)
+                # --- CLEAN SCALE A100 FIX ---
         
-        # 2. Dead Neuron Protection (Numerical Safety)
-        # If a diagonal is 0, the feature is dead. We set it to 1 to allow inversion.
-        dead = torch.diag(H) == 0
-        H[dead, dead] = 1
-        
-        # 3. Add Damping (Tikhonov Regularization)
-        damp = args.percdamp * torch.mean(torch.diag(H))
-        diag = torch.arange(H.shape[0], device=H.device)
-        H[diag, diag] += damp
-        
-        # 4. Invert using Cholesky (Most stable for A100)
-        # We use try/except as a final safety layer for giant models
-        # 5. Calculate Pseudo-inverse: Xinv = X.T @ H_inv
-        # We need Xinv to be (Samples x Features) to multiply with (Neurons x Samples)
-       
-        try:
-            L = torch.linalg.cholesky(H)
-            H_inv = torch.cholesky_inverse(L)
-        except torch._C._LinAlgError:
-            # Fallback to standard inverse if Cholesky fails due to noise
-            H_inv = torch.inverse(H)
-        
-        # 5. Calculate Pseudo-inverse: Xinv = H_inv @ X.T
-        # We perform this in float32 for accuracy, then cast to half
+        # 1. Use the RAW activations X (convert to float32 for math)
         X_f32 = X.to(dtype=torch.float32)
-        # If X is (Features x Samples), we need the Transpose first
-        if X_f32.shape[0] < X_f32.shape[1]:
-            # X is [768, 131072], so X.T is [131072, 768]
-            # Correct order: [131072, 768] @ [768, 768] = [131072, 768]
-            Xinv = torch.matmul(X_f32.T, H_inv).half()
-        else:
-            # This handles the case if X was not transposed earlier
-            Xinv = torch.matmul(X_f32, H_inv).half()
         
-        # 6. Cleanup
-        del H, H_inv, diag, L, X_f32
+        # 2. Calculate a CLEAN Hessian (not the one from gpts object!)
+        # This ensures the scale is exactly 1:1 with your activations
+        H_clean = torch.matmul(X_f32.T, X_f32)
+        
+        # 3. Add a tiny epsilon for inversion stability (matches pinverse behavior)
+        eps = 1e-9
+        H_inv = torch.inverse(H_clean + eps * torch.eye(H_clean.shape[0], device=H_clean.device))
+        
+        # 4. Calculate Xinv = X @ (X^T @ X)^-1
+        # Order: [Samples x Features] @ [Features x Features] = [Samples x Features]
+        Xinv = torch.matmul(X_f32, H_inv).half()
+        
+        # 5. Important: Free the clean Hessian immediately
+        del X_f32, H_clean, H_inv
         torch.cuda.empty_cache()
         # Pre-compute the pinverse of X and cache it to save computational cost
         # Xinv = torch.pinverse(X.to(dtype=torch.float32)).half()
